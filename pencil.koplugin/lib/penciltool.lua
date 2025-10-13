@@ -296,6 +296,14 @@ function PencilTool:experimentalTextHighlight()
     return self.experimental_text_highlight
 end
 
+-- Reset transient highlighter state without changing the selected main tool.
+-- Used when a highlighter picker closes: stale button/contact state must not
+-- make the next plain pen contact behave as a highlighter.
+function PencilTool:resetHighlighterState()
+    self.highlighting = false
+    self.highlight_freehand = false
+end
+
 --
 -- Callbacks and event helpers
 --
