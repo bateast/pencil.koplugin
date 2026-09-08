@@ -291,11 +291,6 @@ function Pencil:onPencilToggleTool()
     else
         self.current_tool = TOOL_ERASER
     end
-    local display_name = self.current_tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 1,
-    })
     return true
 end
 
@@ -320,19 +315,11 @@ end
 
 function Pencil:onPencilSelectPen()
     self.current_tool = TOOL_PEN
-    UIManager:show(InfoMessage:new{
-        text = _("Pencil tool: pencil"),
-        timeout = 1,
-    })
     return true
 end
 
 function Pencil:onPencilSelectEraser()
     self.current_tool = TOOL_ERASER
-    UIManager:show(InfoMessage:new{
-        text = _("Eraser selected"),
-        timeout = 1,
-    })
     return true
 end
 
@@ -1084,12 +1071,6 @@ end
 function Pencil:setTool(tool)
     self.current_tool = tool
     self:saveSettings()
-    -- Show visual feedback with proper display name
-    local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 1,
-    })
 end
 
 function Pencil:isEnabled()
@@ -1496,12 +1477,6 @@ function Pencil:togglePenEraser()
     self.current_tool = new_tool
     self:saveSettings()
     logger.dbg("Pencil: toggled from", old_tool, "to", new_tool)
-
-    -- Show brief visual feedback
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), new_tool),
-        timeout = 0.5,
-    })
 end
 
 -- Handle stylus button and tool events
