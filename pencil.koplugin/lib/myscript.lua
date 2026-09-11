@@ -121,11 +121,8 @@ local function convert_stroke(source, default_pointer_type, default_pointer_id)
         result = { x = {}, y = {} }
         for i, point in ipairs(coordinates) do
             local x, y = tonumber(point.x), tonumber(point.y)
-            if not x or not y then
-                return nil, "Invalid point at index " .. tostring(i)
-            end
-            result.x[#result.x + 1] = x
-            result.y[#result.y + 1] = y
+            if not x or not y then return nil, "Invalid point at index " .. tostring(i) end
+            result.x[#result.x + 1], result.y[#result.y + 1] = x, y
         end
     elseif type(source.x) == "table" and type(source.y) == "table" then
         result = { x = copy_array(source.x), y = copy_array(source.y) }

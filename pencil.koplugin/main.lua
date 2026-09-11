@@ -1048,7 +1048,6 @@ function Pencil:loadSettings()
     self.experimental_text_highlight = settings.experimental_text_highlight or false
     -- Auto-save pencil ink into the PDF file when the document is closed.
     self.auto_save_pdf = settings.auto_save_pdf or false
-    -- MyScript handwriting recognition settings.
     self.myscript_language = settings.myscript_language or "en_US"
     self.myscript_application_key = settings.myscript_application_key or ""
     self.myscript_hmac_key = settings.myscript_hmac_key or ""
@@ -1358,22 +1357,10 @@ function Pencil:addToMainMenu(menu_items)
             {
                 text = _("Handwriting recognition"),
                 sub_item_table = {
-                    {
-                        text = _("Configure MyScript"),
-                        callback = function()
-                            self:showMyScriptSettingsDialog()
-                        end,
-                    },
-                    {
-                        text = _("Recognize latest annotation group"),
-                        enabled_func = function()
-                            return self:getLatestAnnotationGroupOnCurrentPage() ~= nil
-                        end,
-                        callback = function()
-                            local group = self:getLatestAnnotationGroupOnCurrentPage()
-                            if group then self:recognizeAnnotationGroup(group) end
-                        end,
-                    },
+                    { text = _("Configure MyScript"), callback = function() self:showMyScriptSettingsDialog() end },
+                    { text = _("Recognize latest annotation group"),
+                      enabled_func = function() return self:getLatestAnnotationGroupOnCurrentPage() ~= nil end,
+                      callback = function() local g = self:getLatestAnnotationGroupOnCurrentPage(); if g then self:recognizeAnnotationGroup(g) end end },
                 },
                 separator = true,
             },
@@ -3218,171 +3205,69 @@ end
 ------------------------------------------------------------------------------
 -- MyScript handwriting recognition
 ------------------------------------------------------------------------------
-local function trimString(value)
-    return tostring(value or ""):match("^%s*(.-)%s*$")
-end
+local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
 
 function Pencil:showMyScriptSettingsDialog()
     local dialog
     dialog = MultiInputDialog:new{
         title = _("MyScript settings"),
         fields = {
-            {
-                description = _("Recognition language"),
-                text = self.myscript_language or "en_US",
-                hint = "en_US",
-            },
-            {
-                description = _("Application key"),
-                text = self.myscript_application_key or "",
-                hint = _("MyScript application key"),
-            },
-            {
-                description = _("HMAC key"),
-                text = self.myscript_hmac_key or "",
-                hint = _("MyScript HMAC key"),
-                text_type = "password",
-            },
+            { description = _("Recognition language"), text = self.myscript_language or "en_US", hint = "en_US" },
+            { description = _("Application key"), text = self.myscript_application_key or "" },
+            { description = _("HMAC key"), text = self.myscript_hmac_key or "", text_type = "password" },
         },
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = function() UIManager:close(dialog) end,
-                },
-                {
-                    text = _("Save"),
-                    is_enter_default = true,
-                    callback = function()
-                        local fields = dialog:getFields()
-                        local language = trimString(fields[1])
-                        local application_key = trimString(fields[2])
-                        local hmac_key = trimString(fields[3])
-                        if language == "" or application_key == "" or hmac_key == "" then
-                            UIManager:show(InfoMessage:new{
-                                text = _("Language, application key, and HMAC key are required."),
-                                timeout = 3,
-                            })
-                            return
-                        end
-                        self.myscript_language = language
-                        self.myscript_application_key = application_key
-                        self.myscript_hmac_key = hmac_key
-                        self:saveSettings()
-                        UIManager:close(dialog)
-                        UIManager:show(InfoMessage:new{
-                            text = _("MyScript settings saved."),
-                            timeout = 2,
-                        })
-                    end,
-                },
-            },
-        },
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local f = dialog:getFields()
+                local lang, app, hmac = trimString(f[1]), trimString(f[2]), trimString(f[3])
+                if lang == "" or app == "" or hmac == "" then
+                    UIManager:show(InfoMessage:new{ text = _("Language, application key, and HMAC key are required."), timeout = 3 })
+                    return
+                end
+                self.myscript_language, self.myscript_application_key, self.myscript_hmac_key = lang, app, hmac
+                self:saveSettings(); UIManager:close(dialog)
+                UIManager:show(InfoMessage:new{ text = _("MyScript settings saved."), timeout = 2 })
+            end },
+        }},
     }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
+    UIManager:show(dialog); dialog:onShowKeyboard()
 end
 
 function Pencil:getLatestAnnotationGroupOnCurrentPage()
-    local current_page = self:getCurrentPage()
-    local latest
-    for _, group in ipairs(self.annotation_groups or {}) do
-        if self:getGroupCurrentPage(group) == current_page
-                and (not latest
-                    or (group.datetime_last or group.datetime or 0)
-                        > (latest.datetime_last or latest.datetime or 0)) then
-            latest = group
-        end
+    local page, latest = self:getCurrentPage(), nil
+    for _, g in ipairs(self.annotation_groups or {}) do
+        if self:getGroupCurrentPage(g) == page and (not latest or (g.datetime_last or g.datetime or 0) > (latest.datetime_last or latest.datetime or 0)) then latest = g end
     end
     return latest
 end
 
--- Build MyScript input from the plugin's live model. No JPEG, screenshot, or
--- sidecar reload is involved: group.stroke_indices selects strokes directly
--- from self.strokes, and the library converts each stroke.points array.
 function Pencil:getMyScriptStrokesForGroup(group)
-    if not group or type(group.stroke_indices) ~= "table" then
-        return nil, { kind = "validation", message = "Invalid annotation group" }
-    end
-    return MyScript.strokes_from_pencil({
-        strokes = self.strokes,
-        annotation_groups = { group },
-    }, {
-        group_index = 1,
-        pointer_type = "PEN",
-        pointer_id = 0,
-    })
+    if not group or type(group.stroke_indices) ~= "table" then return nil, { message = "Invalid annotation group" } end
+    return MyScript.strokes_from_pencil({ strokes = self.strokes, annotation_groups = { group } }, { group_index = 1, pointer_type = "PEN", pointer_id = 0 })
 end
 
 function Pencil:showRecognizedText(text, group)
     UIManager:show(TextViewer:new{
         title = T(_("Handwriting - page %1"), self:getPageNumber(group.page)),
         text = text,
-        text_type = "text",
+        text_settings = {},
     })
 end
 
 function Pencil:recognizeAnnotationGroup(group)
-    if trimString(self.myscript_application_key) == ""
-            or trimString(self.myscript_hmac_key) == "" then
-        self:showMyScriptSettingsDialog()
-        return
-    end
-
+    if trimString(self.myscript_application_key) == "" or trimString(self.myscript_hmac_key) == "" then self:showMyScriptSettingsDialog(); return end
     NetworkMgr:runWhenOnline(function()
-        local strokes, conversion_error = self:getMyScriptStrokesForGroup(group)
-        if not strokes then
-            UIManager:show(InfoMessage:new{
-                text = T(_("Cannot prepare annotation: %1"),
-                    tostring(conversion_error and conversion_error.message or conversion_error)),
-            })
-            return
-        end
-
-        local client, client_error = MyScript.new{
-            application_key = self.myscript_application_key,
-            hmac_key = self.myscript_hmac_key,
-            language = self.myscript_language,
-            content_type = "Text",
-            client_name = "koreader-pencil-plugin",
-            client_version = "1.0.0",
-        }
-        if not client then
-            UIManager:show(InfoMessage:new{
-                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
-            })
-            return
-        end
-
-        UIManager:show(InfoMessage:new{
-            text = _("Recognizing handwriting..."),
-            timeout = 1,
-        })
-
-        local ok, text, api_error = pcall(client.recognize_text, client, strokes, {
-            language = self.myscript_language,
-        })
-        if not ok then
-            logger.warn("Pencil: MyScript call failed:", tostring(text))
-            UIManager:show(InfoMessage:new{
-                text = _("MyScript request failed unexpectedly."),
-            })
-            return
-        end
-        if not text or trimString(text) == "" then
-            local message = api_error and api_error.message or _("No text was recognized.")
-            logger.warn("Pencil: MyScript recognition failed:", tostring(message))
-            UIManager:show(InfoMessage:new{
-                text = T(_("Recognition failed: %1"), tostring(message)),
-            })
-            return
-        end
-
-        group.transcription = trimString(text)
-        group.transcription_language = self.myscript_language
-        self:saveStrokes()
-        self:showRecognizedText(group.transcription, group)
+        local strokes, e = self:getMyScriptStrokesForGroup(group)
+        if not strokes then UIManager:show(InfoMessage:new{ text = T(_("Cannot prepare annotation: %1"), tostring(e and e.message or e)) }); return end
+        local client, ce = MyScript.new{ application_key = self.myscript_application_key, hmac_key = self.myscript_hmac_key, language = self.myscript_language, content_type = "Text", client_name = "koreader-pencil-plugin", client_version = "1.0.1" }
+        if not client then UIManager:show(InfoMessage:new{ text = T(_("Invalid MyScript configuration: %1"), tostring(ce)) }); return end
+        UIManager:show(InfoMessage:new{ text = _("Recognizing handwriting..."), timeout = 1 })
+        local ok, text, ae = pcall(client.recognize_text, client, strokes, { language = self.myscript_language })
+        if not ok then logger.warn("Pencil: MyScript call failed:", tostring(text)); UIManager:show(InfoMessage:new{ text = _("MyScript request failed unexpectedly.") }); return end
+        if not text or trimString(text) == "" then UIManager:show(InfoMessage:new{ text = T(_("Recognition failed: %1"), tostring(ae and ae.message or _("No text was recognized."))) }); return end
+        group.transcription, group.transcription_language = trimString(text), self.myscript_language
+        self:saveStrokes(); self:showRecognizedText(group.transcription, group)
     end)
 end
 
