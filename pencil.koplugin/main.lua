@@ -3374,21 +3374,34 @@ function Pencil:hasRecognizedAnnotations()
 end
 
 function Pencil:getAllRecognizedText()
+    local gettext = _
     local groups = {}
+
     for _, group in ipairs(self.annotation_groups or {}) do
-        if trimString(group.transcription) ~= "" then groups[#groups + 1] = group end
+        if trimString(group.transcription) ~= "" then
+            groups[#groups + 1] = group
+        end
     end
+
     table.sort(groups, function(a, b)
-        local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
-        if ap ~= bp then return ap < bp end
-        return (a.datetime or 0) < (b.datetime or 0)
+                   local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
+
+                   if ap ~= bp then
+                       return ap < bp
+                   end
+
+                   return (a.datetime or 0) < (b.datetime or 0)
     end)
 
     local parts = {}
-    for _, group in ipairs(groups) do
-        parts[#parts + 1] = T(_("Page %1"), self:getPageNumber(group.page))
-            .. "\n" .. trimString(group.transcription)
+
+    for index, group in ipairs(groups) do
+        parts[#parts + 1] =
+            T(gettext("Page %1"), self:getPageNumber(group.page))
+            .. "\n"
+            .. trimString(group.transcription)
     end
+
     return table.concat(parts, "\n\n")
 end
 
