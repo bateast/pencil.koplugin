@@ -1361,6 +1361,24 @@ function Pencil:addToMainMenu(menu_items)
                     { text = _("Recognize latest annotation group"),
                       enabled_func = function() return self:getLatestAnnotationGroupOnCurrentPage() ~= nil end,
                       callback = function() local g = self:getLatestAnnotationGroupOnCurrentPage(); if g then self:recognizeAnnotationGroup(g) end end },
+                    {
+                        text = _("Recognize all annotation groups"),
+                        enabled_func = function()
+                            return self.annotation_groups and #self.annotation_groups > 0
+                        end,
+                        callback = function()
+                            self:recognizeAllAnnotationGroups()
+                        end,
+                    },
+                    {
+                        text = _("Show all recognized text"),
+                        enabled_func = function()
+                            return self:hasRecognizedAnnotations()
+                        end,
+                        callback = function()
+                            self:showAllRecognizedText()
+                        end,
+                    },
                 },
                 separator = true,
             },
@@ -3255,19 +3273,190 @@ function Pencil:showRecognizedText(text, group)
     })
 end
 
+function Pencil:createMyScriptClient()
+    return MyScript.new{
+        application_key = self.myscript_application_key,
+        hmac_key = self.myscript_hmac_key,
+        language = self.myscript_language,
+        content_type = "Text",
+        client_name = "koreader-pencil-plugin",
+        client_version = "1.1.0",
+    }
+end
+
+-- Store recognition on the group and on every stroke referenced by the group.
+-- A stroke keeps group id + text, which avoids ambiguity if groups are rebuilt.
+function Pencil:enrichAnnotationGroup(group, text)
+    text = trimString(text)
+    if not group or text == "" then return false end
+
+    local recognized_at = os.time()
+    group.transcription = text
+    group.transcription_language = self.myscript_language
+    group.transcription_datetime = recognized_at
+    group.transcription_engine = "myscript"
+
+    for _, stroke_index in ipairs(group.stroke_indices or {}) do
+        local stroke = self.strokes[stroke_index]
+        if stroke then
+            stroke.transcription = text
+            stroke.transcription_group_id = group.id
+            stroke.transcription_language = self.myscript_language
+            stroke.transcription_datetime = recognized_at
+            stroke.transcription_engine = "myscript"
+        end
+    end
+    return true
+end
+
+function Pencil:recognizeGroupWithClient(client, group)
+    local strokes, conversion_error = self:getMyScriptStrokesForGroup(group)
+    if not strokes then
+        return nil, conversion_error
+    end
+
+    local ok, text, api_error = pcall(client.recognize_text, client, strokes, {
+        language = self.myscript_language,
+    })
+    if not ok then
+        logger.warn("Pencil: MyScript call failed:", tostring(text))
+        return nil, { message = tostring(text), kind = "unexpected" }
+    end
+    text = trimString(text)
+    if text == "" then
+        return nil, api_error or { message = _("No text was recognized.") }
+    end
+
+    self:enrichAnnotationGroup(group, text)
+    return text
+end
+
 function Pencil:recognizeAnnotationGroup(group)
-    if trimString(self.myscript_application_key) == "" or trimString(self.myscript_hmac_key) == "" then self:showMyScriptSettingsDialog(); return end
+    if trimString(self.myscript_application_key) == ""
+            or trimString(self.myscript_hmac_key) == "" then
+        self:showMyScriptSettingsDialog()
+        return
+    end
+
     NetworkMgr:runWhenOnline(function()
-        local strokes, e = self:getMyScriptStrokesForGroup(group)
-        if not strokes then UIManager:show(InfoMessage:new{ text = T(_("Cannot prepare annotation: %1"), tostring(e and e.message or e)) }); return end
-        local client, ce = MyScript.new{ application_key = self.myscript_application_key, hmac_key = self.myscript_hmac_key, language = self.myscript_language, content_type = "Text", client_name = "koreader-pencil-plugin", client_version = "1.0.1" }
-        if not client then UIManager:show(InfoMessage:new{ text = T(_("Invalid MyScript configuration: %1"), tostring(ce)) }); return end
-        UIManager:show(InfoMessage:new{ text = _("Recognizing handwriting..."), timeout = 1 })
-        local ok, text, ae = pcall(client.recognize_text, client, strokes, { language = self.myscript_language })
-        if not ok then logger.warn("Pencil: MyScript call failed:", tostring(text)); UIManager:show(InfoMessage:new{ text = _("MyScript request failed unexpectedly.") }); return end
-        if not text or trimString(text) == "" then UIManager:show(InfoMessage:new{ text = T(_("Recognition failed: %1"), tostring(ae and ae.message or _("No text was recognized."))) }); return end
-        group.transcription, group.transcription_language = trimString(text), self.myscript_language
-        self:saveStrokes(); self:showRecognizedText(group.transcription, group)
+        local client, client_error = self:createMyScriptClient()
+        if not client then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+            })
+            return
+        end
+
+        UIManager:show(InfoMessage:new{
+            text = _("Recognizing handwriting..."),
+            timeout = 1,
+        })
+
+        local text, error_value = self:recognizeGroupWithClient(client, group)
+        if not text then
+            local message = error_value and error_value.message or error_value
+            UIManager:show(InfoMessage:new{
+                text = T(_("Recognition failed: %1"), tostring(message)),
+            })
+            return
+        end
+
+        self:saveStrokes()
+        self:showRecognizedText(text, group)
+    end)
+end
+
+function Pencil:hasRecognizedAnnotations()
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then return true end
+    end
+    return false
+end
+
+function Pencil:getAllRecognizedText()
+    local groups = {}
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then groups[#groups + 1] = group end
+    end
+    table.sort(groups, function(a, b)
+        local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
+        if ap ~= bp then return ap < bp end
+        return (a.datetime or 0) < (b.datetime or 0)
+    end)
+
+    local parts = {}
+    for _, group in ipairs(groups) do
+        parts[#parts + 1] = T(_("Page %1"), self:getPageNumber(group.page))
+            .. "\n" .. trimString(group.transcription)
+    end
+    return table.concat(parts, "\n\n")
+end
+
+function Pencil:showAllRecognizedText()
+    local text = self:getAllRecognizedText()
+    if text == "" then
+        UIManager:show(InfoMessage:new{ text = _("No recognized annotations.") })
+        return
+    end
+    UIManager:show(TextViewer:new{
+        title = _("Recognized annotations"),
+        text = text,
+        text_settings = {},
+    })
+end
+
+-- Recognize every current annotation group, enrich groups and their referenced
+-- strokes, then persist once. Processing continues after per-group failures.
+function Pencil:recognizeAllAnnotationGroups()
+    if trimString(self.myscript_application_key) == ""
+            or trimString(self.myscript_hmac_key) == "" then
+        self:showMyScriptSettingsDialog()
+        return
+    end
+    if not self.annotation_groups or #self.annotation_groups == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No annotation groups to recognize.") })
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local client, client_error = self:createMyScriptClient()
+        if not client then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+            })
+            return
+        end
+
+        local recognized, failed = 0, 0
+        UIManager:show(InfoMessage:new{
+            text = T(_("Recognizing %1 annotation group(s)..."), #self.annotation_groups),
+            timeout = 1,
+        })
+
+        for group_index, group in ipairs(self.annotation_groups) do
+            local text, error_value = self:recognizeGroupWithClient(client, group)
+            if text then
+                group.transcription_error = nil
+                recognized = recognized + 1
+            else
+                local message = error_value and error_value.message or error_value
+                group.transcription_error = tostring(message or _("Unknown recognition error"))
+                group.transcription_error_datetime = os.time()
+                failed = failed + 1
+                logger.warn("Pencil: recognition failed for group", group_index,
+                    group.id or "(no id)", group.transcription_error)
+            end
+        end
+
+        -- Persist all group fields and all stroke-level enrichment atomically
+        -- through the plugin's existing sidecar serialization path.
+        self:saveStrokes()
+
+        local summary = T(_("Recognized %1 annotation group(s)."), recognized)
+        if failed > 0 then
+            summary = summary .. "\n" .. T(_("Failed: %1."), failed)
+        end
+        UIManager:show(InfoMessage:new{ text = summary, timeout = 4 })
     end)
 end
 
@@ -4842,6 +5031,11 @@ function Pencil:strokeToSaveable(stroke)
         color_name = stroke.color_name,  -- Save color name for persistence
         embedded = stroke.embedded,      -- true once written into the PDF file
         annot_id = stroke.annot_id,      -- tag of its PDF annotation (for the eraser)
+        transcription = stroke.transcription,
+        transcription_group_id = stroke.transcription_group_id,
+        transcription_language = stroke.transcription_language,
+        transcription_datetime = stroke.transcription_datetime,
+        transcription_engine = stroke.transcription_engine,
     }
 end
 
@@ -4882,6 +5076,11 @@ function Pencil:strokeFromSaved(saved)
         points = points,
         embedded = saved.embedded,
         annot_id = saved.annot_id,
+        transcription = saved.transcription,
+        transcription_group_id = saved.transcription_group_id,
+        transcription_language = saved.transcription_language,
+        transcription_datetime = saved.transcription_datetime,
+        transcription_engine = saved.transcription_engine,
     }
 end
 
@@ -4917,12 +5116,13 @@ function Pencil:saveStrokes()
         saveable_strokes[i] = self:strokeToSaveable(stroke)
     end
 
-    -- Serialize and write. Version 4 packs each stroke's points into a single
+    -- Serialize and write. Version 5 keeps v4 packed points and adds optional
+    -- MyScript transcription metadata to strokes and annotation groups. Version 4
     -- "x y x y ..." string (field `p`) instead of an array of {x=,y=} tables,
     -- cutting serialize time + file size on heavily-annotated documents. v3 and
     -- earlier (points array) still load via strokeFromSaved's fallback.
     local data = {
-        version = 4,
+        version = 5,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
     }
