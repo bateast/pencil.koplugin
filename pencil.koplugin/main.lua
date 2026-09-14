@@ -6,6 +6,7 @@ Enables freehand drawing and annotation with stylus on supported devices.
 --]]--
 
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
@@ -34,6 +35,7 @@ local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local time = require("ui/time")
+local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
 
 -- Check if device supports touch input
 if not Device:isTouchDevice() then
@@ -44,8 +46,6 @@ end
 local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
-
-local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
 
 -- Native PDF ink-annotation support (issue #63).
 --
@@ -1715,25 +1715,6 @@ function Pencil:setupPenInput()
             end,
         },
         {
-            id = "pencil_annotation_hold",
-            ges = "hold",
-            screen_zone = {
-                ratio_x = 0, ratio_y = 0,
-                ratio_w = 1, ratio_h = 1,
-            },
-
-            -- IMPORTANT :
-            -- doit intercepter avant ReaderHighlight
-            overrides = {
-                "readerhighlight_hold",
-                "readerfooter_hold",
-            },
-
-            handler = function(ges)
-                return self:onAnnotationHold(ges)
-            end,
-        },
-        {
             id = "pencil_draw_hold",
             ges = "hold",
             screen_zone = {
@@ -1811,7 +1792,6 @@ function Pencil:teardownPenInput()
     self.ui:unRegisterTouchZones({
         { id = "pencil_draw_touch" },  -- Must unregister touch zone too
         { id = "pencil_draw_tap" },
-        { id = "pencil_annotation_hold" },
         { id = "pencil_draw_hold" },
         { id = "pencil_draw_pan" },
         { id = "pencil_draw_pan_release" },
@@ -1837,37 +1817,21 @@ end
 
 -- Handle tip long press (hold gesture)
 function Pencil:onDrawHold(ges)
-    if not self:isEnabled() or self:isOverlayActive() then
-        return false
-    end
+    if not self:isEnabled() or self:isOverlayActive() then return false end
 
+    -- Annotation/badge interception has priority over ReaderHighlight.
     if ges and ges.pos then
-        local group =
-            self:findGroupBadgeAtPoint(
-                ges.pos.x,
-                ges.pos.y
-            )
-            or
-            self:findAnnotationGroupAtPoint(
-                ges.pos.x,
-                ges.pos.y
-            )
-
+        local group = self:findGroupBadgeAtPoint(ges.pos.x, ges.pos.y)
+            or self:findAnnotationGroupAtPoint(ges.pos.x, ges.pos.y)
         if group then
-            return false
+            self:showAnnotationHoldMenu(group)
+            return true
         end
     end
 
-    if self.pen_down then
-        return true
-    end
-
+    if self.pen_down then return true end
     local is_pen = select(1, self:isPenInput(ges))
-
-    if not is_pen then
-        return false
-    end
-
+    if not is_pen then return false end
     return true
 end
 
@@ -2691,47 +2655,59 @@ function Pencil:findAnnotationGroupAtPoint(x, y)
     return nil
 end
 
--- Open the recognized handwriting text for an hold annotation or badge.
--- Returning false outside an annotation preserves KOReader's normal gesture.
-function Pencil:onAnnotationHold(ges)
-    if not self:isEnabled()
-        or self:isOverlayActive()
-        or not ges
-        or not ges.pos then
-        return false
-    end
+-- Show annotation actions after a priority long press.
+function Pencil:showAnnotationHoldMenu(group)
+    if not group then return end
 
-    local group =
-        self:findGroupBadgeAtPoint(
-            ges.pos.x,
-            ges.pos.y
-        )
-
-    if not group then
-        group =
-            self:findAnnotationGroupAtPoint(
-                ges.pos.x,
-                ges.pos.y
-            )
-    end
-
-    if not group then
-        return false
-    end
-
+    local dialog
     local text = trimString(group.transcription)
+    local rows = {}
 
-    if text == "" then
-        UIManager:show(InfoMessage:new{
-                           text = _("No recognized text for this annotation."),
-                           timeout = 2,
-        })
-        return true
+    if text ~= "" then
+        rows[#rows + 1] = {{
+            text = _("Show recognized text"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showRecognizedText(text, group)
+            end,
+        }}
+        rows[#rows + 1] = {{
+            text = _("Recognize again"),
+            callback = function()
+                UIManager:close(dialog)
+                self:recognizeAnnotationGroup(group)
+            end,
+        }}
+    else
+        rows[#rows + 1] = {{
+            text = _("Recognize this annotation"),
+            callback = function()
+                UIManager:close(dialog)
+                self:recognizeAnnotationGroup(group)
+            end,
+        }}
     end
 
-    self:showRecognizedText(text, group)
+    if group.image_path then
+        rows[#rows + 1] = {{
+            text = _("Show saved image"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showGroupImagePreview(group)
+            end,
+        }}
+    end
 
-    return true
+    rows[#rows + 1] = {{
+        text = _("Cancel"),
+        callback = function() UIManager:close(dialog) end,
+    }}
+
+    dialog = ButtonDialog:new{
+        title = T(_("Pencil annotation - page %1"), self:getPageNumber(group.page)),
+        buttons = rows,
+    }
+    UIManager:show(dialog)
 end
 
 -- Called on tap - create a dot or erase at point
@@ -3259,10 +3235,22 @@ function Pencil:syncGroupBookmark(group)
         local datetime = group.id  -- use group id as unique datetime key
         group.bookmark_datetime = datetime
 
+        local transcription = trimString(group.transcription)
+        local bookmark_text
+
+        if transcription ~= "" then
+            bookmark_text = transcription
+        else
+            bookmark_text = string.format(
+                "Pencil annotation on page %d",
+                pageno
+            )
+        end
+
         local item = {
             page = bookmark_page,
             datetime = datetime,
-            text = string.format("Pencil annotation on page %d", pageno),
+            text = bookmark_text,
             chapter = chapter,
         }
 
@@ -3333,6 +3321,7 @@ end
 ------------------------------------------------------------------------------
 -- MyScript handwriting recognition
 ------------------------------------------------------------------------------
+
 function Pencil:showMyScriptSettingsDialog()
     local dialog
     dialog = MultiInputDialog:new{
@@ -3414,6 +3403,13 @@ function Pencil:enrichAnnotationGroup(group, text)
             stroke.transcription_engine = "myscript"
         end
     end
+
+    -- Refresh the associated native KOReader bookmark immediately so its
+    -- displayed text reflects the newly recognized handwriting.
+    if self.experimental_bookmark_sync then
+        self:syncGroupBookmark(group)
+    end
+
     return true
 end
 
@@ -3956,7 +3952,7 @@ function Pencil:getStaleGroupsForCurrentView()
     return stale
 end
 
--- Hit-test the rotation badges on the current page. Mirrors the drawing
+-- Hit-test the rotation badges on the current page. Mirrors the drawing-
 -- logic in paintTo: a badge is tappable iff its group would have its badge
 -- drawn by the current render pass.
 function Pencil:findGroupBadgeAtPoint(x, y)
