@@ -45,6 +45,8 @@ local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
 
+local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
+
 -- Native PDF ink-annotation support (issue #63).
 --
 -- We call koreader-base's MuPDF wrapper directly, so this feature patches NO
@@ -92,6 +94,7 @@ local IMAGE_CAPTURE_DEBOUNCE_S = 4       -- seconds after last stroke before cap
 local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotation is stale
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
+local ANNOTATION_HOLD_HIT_PAD = 18  -- extra pixels around annotation bbox
 
 -- Module-level reference to the most recently initialized Pencil instance.
 -- Used by the bookmark-list hook (a class-level monkey-patch installed once)
@@ -1712,6 +1715,25 @@ function Pencil:setupPenInput()
             end,
         },
         {
+            id = "pencil_annotation_hold",
+            ges = "hold",
+            screen_zone = {
+                ratio_x = 0, ratio_y = 0,
+                ratio_w = 1, ratio_h = 1,
+            },
+
+            -- IMPORTANT :
+            -- doit intercepter avant ReaderHighlight
+            overrides = {
+                "readerhighlight_hold",
+                "readerfooter_hold",
+            },
+
+            handler = function(ges)
+                return self:onAnnotationHold(ges)
+            end,
+        },
+        {
             id = "pencil_draw_hold",
             ges = "hold",
             screen_zone = {
@@ -1789,6 +1811,7 @@ function Pencil:teardownPenInput()
     self.ui:unRegisterTouchZones({
         { id = "pencil_draw_touch" },  -- Must unregister touch zone too
         { id = "pencil_draw_tap" },
+        { id = "pencil_annotation_hold" },
         { id = "pencil_draw_hold" },
         { id = "pencil_draw_pan" },
         { id = "pencil_draw_pan_release" },
@@ -1814,16 +1837,37 @@ end
 
 -- Handle tip long press (hold gesture)
 function Pencil:onDrawHold(ges)
-    if not self:isEnabled() or self:isOverlayActive() then return false end
+    if not self:isEnabled() or self:isOverlayActive() then
+        return false
+    end
 
-    -- If raw input detected pen, block hold to prevent reader highlight mode
-    if self.pen_down then return true end
+    if ges and ges.pos then
+        local group =
+            self:findGroupBadgeAtPoint(
+                ges.pos.x,
+                ges.pos.y
+            )
+            or
+            self:findAnnotationGroupAtPoint(
+                ges.pos.x,
+                ges.pos.y
+            )
 
-    -- Fallback: check pen input via gesture system's slot data
-    local is_pen, _ = self:isPenInput(ges)
-    if not is_pen then return false end
+        if group then
+            return false
+        end
+    end
 
-    -- Block pen hold gestures while drawing mode is active
+    if self.pen_down then
+        return true
+    end
+
+    local is_pen = select(1, self:isPenInput(ges))
+
+    if not is_pen then
+        return false
+    end
+
     return true
 end
 
@@ -2624,6 +2668,72 @@ function Pencil:getEffectiveTool(is_eraser_end, is_highlighter)
     return self.current_tool
 end
 
+-- Find the topmost visible pencil annotation group at a screen position.
+-- Stale-rotation groups are excluded because their saved bbox is not valid in
+-- the current layout; those remain accessible through their rotation badge.
+function Pencil:findAnnotationGroupAtPoint(x, y)
+    local page = self:getCurrentPage()
+    local rotation = Screen:getRotationMode()
+    local groups = self.annotation_groups or {}
+    for i = #groups, 1, -1 do
+        local group = groups[i]
+        local bbox = group.bbox
+        local same_rotation = group.image_rotation == nil
+            or group.image_rotation == rotation
+        if bbox and same_rotation and self:getGroupCurrentPage(group) == page
+                and x >= bbox.x0 - ANNOTATION_HOLD_HIT_PAD
+                and x <= bbox.x1 + ANNOTATION_HOLD_HIT_PAD
+                and y >= bbox.y0 - ANNOTATION_HOLD_HIT_PAD
+                and y <= bbox.y1 + ANNOTATION_HOLD_HIT_PAD then
+            return group
+        end
+    end
+    return nil
+end
+
+-- Open the recognized handwriting text for an hold annotation or badge.
+-- Returning false outside an annotation preserves KOReader's normal gesture.
+function Pencil:onAnnotationHold(ges)
+    if not self:isEnabled()
+        or self:isOverlayActive()
+        or not ges
+        or not ges.pos then
+        return false
+    end
+
+    local group =
+        self:findGroupBadgeAtPoint(
+            ges.pos.x,
+            ges.pos.y
+        )
+
+    if not group then
+        group =
+            self:findAnnotationGroupAtPoint(
+                ges.pos.x,
+                ges.pos.y
+            )
+    end
+
+    if not group then
+        return false
+    end
+
+    local text = trimString(group.transcription)
+
+    if text == "" then
+        UIManager:show(InfoMessage:new{
+                           text = _("No recognized text for this annotation."),
+                           timeout = 2,
+        })
+        return true
+    end
+
+    self:showRecognizedText(text, group)
+
+    return true
+end
+
 -- Called on tap - create a dot or erase at point
 function Pencil:onDrawTap(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
@@ -3223,8 +3333,6 @@ end
 ------------------------------------------------------------------------------
 -- MyScript handwriting recognition
 ------------------------------------------------------------------------------
-local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
-
 function Pencil:showMyScriptSettingsDialog()
     local dialog
     dialog = MultiInputDialog:new{
