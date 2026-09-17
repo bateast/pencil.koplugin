@@ -124,6 +124,11 @@ local Pencil = InputContainer:extend{
 
     -- Delayed refresh - only refresh after user stops writing
     pending_refresh = nil,
+
+    -- Références vers les traits affichés temporairement en noir.
+    -- Ils seront redessinés directement en couleur après le délai.
+    pending_color_strokes = nil,
+    pending_color_repaint = false,
     refresh_delay_ms = 600, -- Wait 600ms after last stroke before final refresh
     -- Screen-space bbox of strokes drawn since the last delayed refresh fired.
     -- The post-lift "clean" refresh is scoped to this region instead of the
@@ -184,6 +189,7 @@ function Pencil:init()
     self.strokes_loaded = false  -- Set true after successful loadStrokes
     self.undo_stack = {}
     self.pending_group_strokes = {}
+    self.pending_color_strokes = {}
 
     -- Initialize highlighter color (yellow)
     self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
@@ -288,6 +294,30 @@ function Pencil:init()
     self:installBookmarkHook()
 
     logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.current_tool, "strokes =", #self.strokes)
+end
+
+function Pencil:getLiveRenderColor(stroke)
+    local color = stroke.color
+
+    if self.live_black_preview
+        and stroke.tool == TOOL_PEN
+        and stroke.color_name
+        and stroke.color_name ~= "Black" then
+        return Blitbuffer.COLOR_BLACK
+    end
+
+    return color
+end
+
+function Pencil:getLiveStrokeColor(stroke)
+    if self.live_black_preview
+        and stroke.tool == TOOL_PEN
+        and stroke.color_name
+        and stroke.color_name ~= "Black" then
+        return Blitbuffer.COLOR_BLACK
+    end
+
+    return stroke.color
 end
 
 -- Dispatcher event handlers (for custom gesture mapping)
@@ -685,11 +715,23 @@ function Pencil:addRawPoint(x, y)
     local n = #self.current_stroke.points
 
     local width = self.current_stroke.width
-    local color = self.current_stroke.color
-    local half_w = math.floor(width / 2) + 2  -- padding for antialiasing
+    local color = self:getLiveStrokeColor(self.current_stroke)
+    local half_w = math.floor(width / 2) + 2
 
     -- Reinvert color in night mode (if it's not black or gray)
-    if Screen.night_mode and self.current_stroke.color_name ~= "Black" and self.current_stroke.color_name ~= "Gray" then
+    local using_black_preview =
+        self.live_black_preview
+        and self.current_stroke.tool == TOOL_PEN
+        and self.current_stroke.color_name
+        and self.current_stroke.color_name ~= "Black"
+
+    if using_black_preview then
+        color = Screen.night_mode
+            and Blitbuffer.COLOR_WHITE
+            or Blitbuffer.COLOR_BLACK
+    elseif Screen.night_mode
+        and self.current_stroke.color_name ~= "Black"
+        and self.current_stroke.color_name ~= "Gray" then
         color = color:invert()
     end
 
@@ -746,7 +788,13 @@ function Pencil:addRawPoint(x, y)
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
             -- Use UI refresh mode for proper color rendering on color e-ink
-            Screen:refreshUI(rx, ry, rw, rh)
+            if self.live_black_preview
+                and self.current_stroke.tool == TOOL_PEN
+                and self.current_stroke.color_name ~= "Black" then
+                Screen:refreshFast(rx, ry, rw, rh)
+            else
+                Screen:refreshUI(rx, ry, rw, rh)
+            end
             self.dirty_region = nil
         end
     end
@@ -775,6 +823,18 @@ function Pencil:endRawStroke()
         -- Track the region this stroke touched so the delayed refresh below
         -- can be scoped to it instead of the whole screen.
         self:accumulateRefreshBbox(self.current_stroke)
+
+        -- Le trait a été affiché directement en noir dans Screen.bb.
+        -- Conserver sa référence pour pouvoir le redessiner directement
+        -- avec sa vraie couleur après le délai.
+        if self.live_black_preview
+            and self.current_stroke.tool == TOOL_PEN
+            and self.current_stroke.color_name
+            and self.current_stroke.color_name ~= "Black" then
+            self.pending_color_strokes = self.pending_color_strokes or {}
+            self.pending_color_strokes[#self.pending_color_strokes + 1] =
+                self.current_stroke
+        end
     else
         if self.input_debug_mode then
             self:writeDebugLog("endRawStroke: NOT SAVED (no current_stroke or no points)")
@@ -1082,6 +1142,8 @@ function Pencil:loadSettings()
             end
         end
     end
+    -- Live rendering options
+    self.live_black_preview = settings.live_black_preview or false
 end
 
 -- Save plugin settings
@@ -1096,6 +1158,7 @@ function Pencil:saveSettings()
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
+        live_black_preview = self.live_black_preview,
     })
 end
 
@@ -1353,6 +1416,24 @@ function Pencil:addToMainMenu(menu_items)
                                     and _("Pencil ink will be saved into the PDF when you close the document.")
                                     or _("Auto-save to PDF disabled."),
                                 timeout = 2,
+                            })
+                        end,
+                    },
+                    {
+                        text = _("Live black preview"),
+                        help_text = _("Draw colored pen strokes in black while writing for faster visual feedback on color e-ink devices. The final delayed refresh redraws them using the selected color."),
+                        checked_func = function()
+                            return self.live_black_preview
+                        end,
+                        callback = function()
+                            self.live_black_preview = not self.live_black_preview
+                            self:saveSettings()
+
+                            UIManager:show(InfoMessage:new{
+                                               text = self.live_black_preview
+                                                   and _("Live black preview enabled.")
+                                                   or _("Live black preview disabled."),
+                                               timeout = 2,
                             })
                         end,
                     },
@@ -1820,37 +1901,68 @@ function Pencil:accumulateRefreshBbox(stroke)
     end
 end
 
--- Schedule a delayed refresh after writing stops
+-- Schedule a delayed refresh after writing stops.
+-- Colored strokes are first displayed in black for low latency, then
+-- redrawn directly into Screen.bb with their saved color. Only the
+-- accumulated stroke bbox is sent through the color refresh waveform.
 function Pencil:scheduleDelayedRefresh()
-    -- Cancel any existing pending refresh
     self:cancelPendingRefresh()
 
-    -- Schedule new refresh. Store the closure itself (not scheduleIn's nil
-    -- return) so cancelPendingRefresh can actually unschedule it.
     local action
     action = function()
-        if self.pending_refresh == action then self.pending_refresh = nil end
-        local bbox = self.pending_refresh_bbox
-        self.pending_refresh_bbox = nil
-        if bbox then
-            -- Scope the fast refresh to the region the recent strokes touched.
-            -- The view still repaints fully, but the slow e-ink update is small.
-            bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
-            local rw = bbox.x1 - bbox.x0
-            local rh = bbox.y1 - bbox.y0
-            if rw > 0 and rh > 0 then
-                local region = Geom:new{ x = bbox.x0, y = bbox.y0, w = rw, h = rh }
-                UIManager:setDirty(self.view, "fast", region)
-            else
-                UIManager:setDirty(self.view, "fast")
-            end
-        else
-            -- No tracked region (e.g. refresh scheduled without a finished
-            -- stroke) — fall back to a full-view fast refresh.
-            UIManager:setDirty(self.view, "fast")
+        if self.pending_refresh == action then
+            self.pending_refresh = nil
         end
-        logger.dbg("Pencil: delayed refresh triggered")
+
+        local bbox = self.pending_refresh_bbox
+        local color_strokes = self.pending_color_strokes
+
+        self.pending_refresh_bbox = nil
+        self.pending_color_strokes = {}
+
+        if not bbox then
+            logger.dbg("Pencil: delayed color refresh skipped: no bbox")
+            return
+        end
+
+        bbox = PencilGeometry.bboxClampToScreen(
+            bbox,
+            Screen:getWidth(),
+            Screen:getHeight()
+        )
+
+        local rx = math.floor(bbox.x0)
+        local ry = math.floor(bbox.y0)
+        local rw = math.ceil(bbox.x1 - bbox.x0)
+        local rh = math.ceil(bbox.y1 - bbox.y0)
+
+        if rw <= 0 or rh <= 0 then
+            logger.dbg("Pencil: delayed color refresh skipped: empty bbox")
+            return
+        end
+
+        -- Replace the temporary black pixels directly with the definitive
+        -- colored strokes. This avoids depending on setDirty/paintTo to
+        -- reconstruct pixels previously written directly into Screen.bb.
+        if color_strokes then
+            for _, stroke in ipairs(color_strokes) do
+                if stroke
+                        and stroke.page == self:getCurrentPage()
+                        and not stroke.embedded then
+                    self:renderStroke(Screen.bb, stroke)
+                end
+            end
+        end
+
+        -- Update only the area occupied by the recently finished strokes.
+        Screen:refreshUI(rx, ry, rw, rh)
+
+        logger.dbg(
+            "Pencil: delayed color refresh triggered for bbox",
+            rx, ry, rw, rh
+        )
     end
+
     self.pending_refresh = action
     UIManager:scheduleIn(self.refresh_delay_ms / 1000, action)
 end
@@ -2570,6 +2682,12 @@ function Pencil:onDrawTouch(ges)
     -- Refresh only happens after user stops writing (delayed refresh)
     local width = tool_settings.width
     local color = tool_settings.color
+
+    if self.live_black_preview
+        and effective_tool == TOOL_PEN
+        and self.tool_settings[TOOL_PEN].color_name ~= "Black" then
+        color = Blitbuffer.COLOR_BLACK
+    end
     local half_w = math.floor(width / 2)
     Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
 
