@@ -135,6 +135,7 @@ local Pencil = InputContainer:extend{
     pending_save = nil,
     save_delay_ms = 1500,
     dirty_groups = nil, -- Set of groups awaiting syncGroupBookmark (id -> group)
+    pending_group_strokes = nil, -- Stroke indices awaiting grouping outside PEN UP
 
     -- Tool settings
     tool_settings = {
@@ -182,6 +183,7 @@ function Pencil:init()
     self.annotation_groups = {}  -- Annotation groups for bookmark integration
     self.strokes_loaded = false  -- Set true after successful loadStrokes
     self.undo_stack = {}
+    self.pending_group_strokes = {}
 
     -- Initialize highlighter color (yellow)
     self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
@@ -656,6 +658,7 @@ function Pencil:startRawStroke()
         color_name = tool_settings.color_name,
         alpha = tool_settings.alpha,
         datetime = os.time(),
+        bbox = nil, -- incrementally maintained; avoids O(points) work at PEN UP
     }
     self.last_refresh_time = time.now()
     self.dirty_region = nil  -- Clear any pending dirty region
@@ -668,6 +671,16 @@ function Pencil:addRawPoint(x, y)
 
     local point = { x = x, y = y }
     table.insert(self.current_stroke.points, point)
+
+    local bbox = self.current_stroke.bbox
+    if bbox then
+        if x < bbox.x0 then bbox.x0 = x end
+        if y < bbox.y0 then bbox.y0 = y end
+        if x > bbox.x1 then bbox.x1 = x end
+        if y > bbox.y1 then bbox.y1 = y end
+    else
+        self.current_stroke.bbox = { x0 = x, y0 = y, x1 = x, y1 = y }
+    end
 
     local n = #self.current_stroke.points
 
@@ -750,7 +763,9 @@ function Pencil:endRawStroke()
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
-        self:assignStrokeToGroup(#self.strokes)
+        -- Keep PEN UP constant-time: grouping scans groups, computes geometry and
+        -- may arm image/bookmark work, so defer it with persistence work.
+        self.pending_group_strokes[#self.pending_group_strokes + 1] = #self.strokes
         self:scheduleDeferredWork()
         if self.input_debug_mode then
             self:writeDebugLog(string.format("endRawStroke: SAVED stroke #%d with %d points, total strokes=%d",
@@ -1794,10 +1809,10 @@ end
 -- small antialiasing pad. The delayed refresh then only updates this region.
 function Pencil:accumulateRefreshBbox(stroke)
     if not stroke then return end
-    local bbox = PencilGeometry.computeStrokeBbox(stroke)
-    if not bbox then return end
+    local source_bbox = stroke.bbox or PencilGeometry.computeStrokeBbox(stroke)
+    if not source_bbox then return end
     local margin = math.floor((stroke.width or 0) / 2) + 4
-    bbox = PencilGeometry.bboxExpand(bbox, margin)
+    local bbox = PencilGeometry.bboxExpand(source_bbox, margin)
     if self.pending_refresh_bbox then
         self.pending_refresh_bbox = PencilGeometry.bboxUnion(self.pending_refresh_bbox, bbox)
     else
@@ -1848,6 +1863,18 @@ function Pencil:cancelPendingRefresh()
     end
 end
 
+-- Process strokes whose annotation grouping was intentionally kept out of PEN UP.
+function Pencil:flushPendingGroups()
+    local pending = self.pending_group_strokes
+    if not pending or #pending == 0 then return end
+    self.pending_group_strokes = {}
+    for _, stroke_idx in ipairs(pending) do
+        if self.strokes[stroke_idx] then
+            self:assignStrokeToGroup(stroke_idx)
+        end
+    end
+end
+
 -- Schedule a debounced save + bookmark flush after writing pauses.
 -- NOTE: UIManager:scheduleIn() returns nil, and UIManager:unschedule() matches
 -- by the action function reference. So we must store the closure itself in
@@ -1858,6 +1885,11 @@ function Pencil:scheduleDeferredWork()
     local action
     action = function()
         if self.pending_save == action then self.pending_save = nil end
+        if self.pen_down then
+            self:scheduleDeferredWork()
+            return
+        end
+        self:flushPendingGroups()
         self:flushDirtyGroups()
         self:saveStrokes()
     end
@@ -1875,10 +1907,13 @@ end
 -- Run any pending deferred work immediately. Called before close, page change,
 -- or any path that must persist state synchronously.
 function Pencil:flushDeferredWork()
-    if not self.pending_save and not (self.dirty_groups and next(self.dirty_groups)) then
+    if not self.pending_save
+            and not (self.pending_group_strokes and #self.pending_group_strokes > 0)
+            and not (self.dirty_groups and next(self.dirty_groups)) then
         return
     end
     self:cancelPendingSave()
+    self:flushPendingGroups()
     self:flushDirtyGroups()
     self:saveStrokes()
 end
@@ -2944,7 +2979,7 @@ function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
     local stroke = self.strokes[stroke_idx]
     if not stroke then return end
 
-    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    local bbox = stroke.bbox or PencilGeometry.computeStrokeBbox(stroke)
     if not bbox then return end
 
     local stroke_time = stroke.datetime or 0
@@ -3356,6 +3391,10 @@ function Pencil:scheduleGroupImageCapture(group, delay)
 
     local cb = function()
         self.pending_image_captures[group.id] = nil
+        if self.pen_down then
+            self:scheduleGroupImageCapture(group, 0.5)
+            return
+        end
         -- The group might have been deleted by the eraser by now.
         local current = nil
         for _, g in ipairs(self.annotation_groups) do
@@ -4782,7 +4821,7 @@ function Pencil:strokeFromSaved(saved)
         points = saved.points or {}
     end
 
-    return {
+    local stroke = {
         page = saved.page,
         tool = saved.tool,
         width = saved.width or tool_settings.width,
@@ -4794,6 +4833,8 @@ function Pencil:strokeFromSaved(saved)
         embedded = saved.embedded,
         annot_id = saved.annot_id,
     }
+    stroke.bbox = PencilGeometry.computeStrokeBbox(stroke)
+    return stroke
 end
 
 -- Save strokes to our own file
