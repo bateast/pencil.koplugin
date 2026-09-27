@@ -1312,6 +1312,15 @@ function Pencil:addToMainMenu(menu_items)
                             self:showAllRecognizedText()
                         end,
                     },
+                    {
+                        text = _("Edit all recognized text"),
+                        enabled_func = function()
+                            return self:hasRecognizedAnnotations()
+                        end,
+                        callback = function()
+                            self:editAllRecognizedText()
+                        end,
+                    },
                 },
                 separator = true,
             },
@@ -2560,6 +2569,13 @@ function Pencil:showAnnotationHoldMenu(group)
             end,
         }}
         rows[#rows + 1] = {{
+            text = _("Edit recognized text"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showAnnotationTextEditor(group)
+            end,
+        }}
+        rows[#rows + 1] = {{
             text = _("Recognize again"),
             callback = function()
                 UIManager:close(dialog)
@@ -2567,6 +2583,13 @@ function Pencil:showAnnotationHoldMenu(group)
             end,
         }}
     else
+        rows[#rows + 1] = {{
+            text = _("Create text"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showAnnotationTextEditor(group)
+            end,
+        }}
         rows[#rows + 1] = {{
             text = _("Recognize this annotation"),
             callback = function()
@@ -3262,17 +3285,18 @@ function Pencil:createMyScriptClient()
     }
 end
 
--- Store recognition on the group and on every stroke referenced by the group.
+-- Store text on the group and on every stroke referenced by the group.
 -- A stroke keeps group id + text, which avoids ambiguity if groups are rebuilt.
-function Pencil:enrichAnnotationGroup(group, text)
+function Pencil:setAnnotationGroupText(group, text, engine)
     text = trimString(text)
     if not group or text == "" then return false end
 
-    local recognized_at = os.time()
+    local updated_at = os.time()
+    local source = engine or "manual"
     group.transcription = text
     group.transcription_language = self.myscript_language
-    group.transcription_datetime = recognized_at
-    group.transcription_engine = "myscript"
+    group.transcription_datetime = updated_at
+    group.transcription_engine = source
 
     for _, stroke_index in ipairs(group.stroke_indices or {}) do
         local stroke = self.strokes[stroke_index]
@@ -3280,18 +3304,59 @@ function Pencil:enrichAnnotationGroup(group, text)
             stroke.transcription = text
             stroke.transcription_group_id = group.id
             stroke.transcription_language = self.myscript_language
-            stroke.transcription_datetime = recognized_at
-            stroke.transcription_engine = "myscript"
+            stroke.transcription_datetime = updated_at
+            stroke.transcription_engine = source
         end
     end
 
-    -- Refresh the associated native KOReader bookmark immediately so its
-    -- displayed text reflects the newly recognized handwriting.
     if self.experimental_bookmark_sync then
         self:syncGroupBookmark(group)
     end
-
     return true
+end
+
+function Pencil:enrichAnnotationGroup(group, text)
+    return self:setAnnotationGroupText(group, text, "myscript")
+end
+
+function Pencil:showAnnotationTextEditor(group)
+    if not group then return end
+
+    local dialog
+    local existing_text = trimString(group.transcription)
+    dialog = MultiInputDialog:new{
+        title = existing_text ~= ""
+            and _("Edit annotation text")
+            or _("Create annotation text"),
+        fields = {{
+            description = _("Text"),
+            text = existing_text,
+            hint = _("Enter annotation text"),
+        }},
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local fields = dialog:getFields()
+                local edited_text = trimString(fields and fields[1])
+                if edited_text == "" then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Annotation text cannot be empty."),
+                        timeout = 2,
+                    })
+                    return
+                end
+                self:setAnnotationGroupText(group, edited_text, "manual")
+                self:saveStrokes()
+                UIManager:close(dialog)
+                UIManager:show(InfoMessage:new{
+                    text = _("Annotation text saved."),
+                    timeout = 2,
+                })
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 function Pencil:recognizeGroupWithClient(client, group)
@@ -3401,6 +3466,87 @@ function Pencil:showAllRecognizedText()
         text = text,
         text_settings = {},
     })
+end
+
+
+-- Edit every annotation that currently has text. One MultiInput field is bound
+-- to one group directly, avoiding fragile parsing of page labels or separators.
+function Pencil:editAllRecognizedText()
+    local groups = {}
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if trimString(group.transcription) ~= "" then
+            groups[#groups + 1] = group
+        end
+    end
+    table.sort(groups, function(a, b)
+        local ap, bp = self:getPageNumber(a.page), self:getPageNumber(b.page)
+        if ap ~= bp then return ap < bp end
+        return (a.datetime or 0) < (b.datetime or 0)
+    end)
+
+    if #groups == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No recognized annotations.") })
+        return
+    end
+
+    local fields = {}
+    for index, group in ipairs(groups) do
+        fields[index] = {
+            description = T(_("Page %1 - annotation %2"),
+                self:getPageNumber(group.page), index),
+            text = trimString(group.transcription),
+            hint = _("Enter annotation text"),
+        }
+    end
+
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = _("Edit all recognized text"),
+        fields = fields,
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Save all"), is_enter_default = true, callback = function()
+                local values = dialog:getFields()
+                if not values or #values ~= #groups then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Unable to read all annotation fields."),
+                        timeout = 2,
+                    })
+                    return
+                end
+
+                -- Validate the whole form before mutating any group, so a single
+                -- empty field cannot leave a partially updated document.
+                local normalized = {}
+                for index = 1, #groups do
+                    normalized[index] = trimString(values[index])
+                    if normalized[index] == "" then
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Text for annotation %1 cannot be empty."), index),
+                            timeout = 3,
+                        })
+                        return
+                    end
+                end
+
+                local changed = 0
+                for index, group in ipairs(groups) do
+                    if normalized[index] ~= trimString(group.transcription) then
+                        self:setAnnotationGroupText(group, normalized[index], "manual")
+                        changed = changed + 1
+                    end
+                end
+                if changed > 0 then self:saveStrokes() end
+                UIManager:close(dialog)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Updated %1 annotation(s)."), changed),
+                    timeout = 3,
+                })
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 -- Recognize every current annotation group, enrich groups and their referenced
