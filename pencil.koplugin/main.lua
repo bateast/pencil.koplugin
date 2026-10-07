@@ -8,7 +8,6 @@ Enables freehand drawing and annotation with stylus on supported devices.
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
-local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
@@ -20,6 +19,7 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local PencilGeometry = require("lib/geometry")
+local PencilTool = require("lib/penciltool")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -42,10 +42,11 @@ if not Device:isTouchDevice() then
     return { disabled = true }
 end
 
--- Tool types
-local TOOL_PEN = "pen"
-local TOOL_HIGHLIGHTER = "highlighter"
-local TOOL_ERASER = "eraser"
+-- Tool types (managed by lib/penciltool.lua)
+local TOOL_PEN = PencilTool.TOOLS.PEN
+local TOOL_HIGHLIGHTER = PencilTool.TOOLS.HIGHLIGHTER
+local TOOL_ERASER = PencilTool.TOOLS.ERASER
+local LINUX_TOOLTYPE = PencilTool.LINUX_TOOLTYPE
 
 -- Native PDF ink-annotation support (issue #63).
 --
@@ -108,21 +109,14 @@ local Pencil = InputContainer:extend{
     is_doc_only = true,  -- Only available when a document is open
     current_stroke = nil,
     strokes = nil,       -- All strokes for current document
-    current_tool = TOOL_PEN,
+    tool = nil,          -- PencilTool instance (tool selection/settings/eraser/highlight state), set in init()
     touch_zones_registered = false,
     undo_stack = {},     -- For undo functionality
-    eraser_tool_active = false,  -- Track if physical eraser end is in use (via BTN_TOOL_RUBBER)
-    eraser_button_active = false,  -- Hardware eraser button held
     eraser_button_deleted = {},    -- Track deletions for undo
-    -- Text-highlight state: true while a side-button + pen-drag is building a
-    -- KOReader text-highlight selection via ReaderHighlight. Sticky through
-    -- pen lift so releasing the side button mid-drag doesn't abort.
-    highlighting = false,
 
     -- Stylus callback for lowest latency (via Input:registerStylusCallback)
     stylus_callback_registered = false,
     pen_down = false,
-    erasing = false,  -- Track if currently in erase mode (for finger modifier)
     pen_x = 0,
     pen_y = 0,
 
@@ -149,24 +143,6 @@ local Pencil = InputContainer:extend{
     save_delay_ms = 1500,
     dirty_groups = nil, -- Set of groups awaiting syncGroupBookmark (id -> group)
     pending_group_strokes = nil, -- Stroke indices awaiting grouping outside PEN UP
-
-    -- Tool settings
-    tool_settings = {
-        [TOOL_PEN] = {
-            width = 3,
-            color = nil,  -- Blitbuffer color, set in init
-            color_name = "Black",  -- For persistence and display
-            alpha = 255,
-        },
-        [TOOL_HIGHLIGHTER] = {
-            width = 20,
-            color = nil,  -- Set in init (needs Blitbuffer)
-            alpha = 128,
-        },
-        [TOOL_ERASER] = {
-            width = 20,
-        },
-    },
 
     -- Side button state
     side_button_down = false,
@@ -199,8 +175,8 @@ function Pencil:init()
     self.pending_group_strokes = {}
     self.pending_color_strokes = {}
 
-    -- Initialize highlighter color (yellow)
-    self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
+    -- Tool selection, per-tool settings, eraser and highlight mode state
+    self.tool = PencilTool:new()
 
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
@@ -231,12 +207,6 @@ function Pencil:init()
 
     -- Load tool and stylus button settings
     self:loadSettings()
-
-    -- Ensure pen color has a default value (black) if not set
-    if not self.tool_settings[TOOL_PEN].color then
-        self.tool_settings[TOOL_PEN].color = Blitbuffer.COLOR_BLACK
-        self.tool_settings[TOOL_PEN].color_name = "Black"
-    end
 
     -- Register as view module to render strokes
     self.view = self.ui.view
@@ -301,20 +271,7 @@ function Pencil:init()
     -- pencil bookmarks open the saved image.
     self:installBookmarkHook()
 
-    logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.current_tool, "strokes =", #self.strokes)
-end
-
-function Pencil:getLiveRenderColor(stroke)
-    local color = stroke.color
-
-    if self.live_black_preview
-        and stroke.tool == TOOL_PEN
-        and stroke.color_name
-        and stroke.color_name ~= "Black" then
-        return Blitbuffer.COLOR_BLACK
-    end
-
-    return color
+    logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.tool:getTool(), "strokes =", #self.strokes)
 end
 
 function Pencil:getLiveStrokeColor(stroke)
@@ -330,11 +287,7 @@ end
 
 -- Dispatcher event handlers (for custom gesture mapping)
 function Pencil:onPencilToggleTool()
-    if self.current_tool == TOOL_ERASER then
-        self.current_tool = TOOL_PEN
-    else
-        self.current_tool = TOOL_ERASER
-    end
+    self.tool:togglePenEraser()
     return true
 end
 
@@ -358,12 +311,12 @@ function Pencil:onPencilToggleEnabled()
 end
 
 function Pencil:onPencilSelectPen()
-    self.current_tool = TOOL_PEN
+    self.tool:setTool(TOOL_PEN)
     return true
 end
 
 function Pencil:onPencilSelectEraser()
-    self.current_tool = TOOL_ERASER
+    self.tool:setTool(TOOL_ERASER)
     return true
 end
 
@@ -409,16 +362,11 @@ end
 -- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
 -- id >= 0 means contact active, id == -1 means contact lifted
 function Pencil:handleStylusSlot(input, slot)
-    -- Tool types from Linux input subsystem
-    local TOOL_TYPE_PEN = 1
-    local TOOL_TYPE_ERASER = 2
-    local TOOL_TYPE_HIGHLIGHTER = 3
-
     -- Debug logging at the very start to see slot.tool
     if self.input_debug_mode then
         self:writeDebugLog(string.format("STYLUS SLOT: id=%d x=%d y=%d tool=%d eraser_active=%s",
             slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
-            tostring(self.eraser_button_active)))
+            tostring(self.tool.eraser_button_active)))
     end
 
     -- Don't capture pen input when a menu or overlay is on top of the reader
@@ -426,24 +374,16 @@ function Pencil:handleStylusSlot(input, slot)
 
     -- Detect eraser end via slot.tool BEFORE key events arrive
     -- This handles the timing issue where stylus callback fires before key events
-    if ((self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_HIGHLIGHTER) or (not self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_ERASER)) and not self.eraser_button_active then
-        logger.info("Pencil: Eraser end detected via slot.tool, activating eraser mode")
-        self.eraser_button_active = true
+    local eraser_change = self.tool:detectEraserAndUpdate(slot)
+    if eraser_change == true then
         self.eraser_button_deleted = {}
-    elseif ((self.swap_eraser_and_highlighter and not (slot.tool == TOOL_TYPE_HIGHLIGHTER)) or (not self.swap_eraser_and_highlighter and not (slot.tool == TOOL_TYPE_ERASER))) and self.eraser_button_active then
+    elseif eraser_change == false then
         -- Switched from eraser end to pen tip
-        logger.info("Pencil: Pen tip detected via slot.tool, deactivating eraser mode")
-        if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
-        end
-        self.eraser_button_active = false
-        self.eraser_button_deleted = nil
-        UIManager:setDirty(self.view, "ui")
+        self:endEraserMode()
     end
 
     -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
-    if self.eraser_button_active then
+    if self.tool.eraser_button_active then
         if slot.id and slot.id >= 0 then
             local raw_x = slot.x or self.pen_x
             local raw_y = slot.y or self.pen_y
@@ -478,14 +418,13 @@ function Pencil:handleStylusSlot(input, slot)
     -- route pen events through KOReader's ReaderHighlight instead of creating
     -- a freehand stroke. Sticky: once we enter, we stay until pen lift even
     -- if the side button is released mid-drag.
-    if self.experimental_text_highlight
-            and (slot.tool == TOOL_TYPE_HIGHLIGHTER or self.highlighting) then
-        local current_slot_id = slot.id or -1
-        if current_slot_id >= 0 and not self.highlighting then
+    local highlight_step = self.tool:detectHighlighting(slot)
+    if highlight_step then
+        if highlight_step == "start" then
             self:startTextHighlight(slot.x or 0, slot.y or 0)
-        elseif current_slot_id >= 0 and self.highlighting then
+        elseif highlight_step == "extend" then
             self:extendTextHighlight(slot.x or 0, slot.y or 0)
-        elseif current_slot_id < 0 and self.highlighting then
+        elseif highlight_step == "finish" then
             self:finishTextHighlight()
         end
         return true
@@ -497,27 +436,19 @@ function Pencil:handleStylusSlot(input, slot)
     if self.input_debug_mode then
         self:writeDebugLog(string.format("STYLUS: slot=%d id=%d x=%d y=%d tool=%d pen_down=%s tool=%s",
             slot.slot or -1, slot.id or -1, slot.x or 0, slot.y or 0, slot.tool or -1,
-            tostring(self.pen_down), self.current_tool))
+            tostring(self.pen_down), self.tool:getTool()))
     end
 
-    -- Determine effective tool:
-    -- 1. Physical eraser end via slot.tool (TOOL_TYPE_ERASER = 2) takes priority
-    -- 2. Physical eraser end via BTN_TOOL_RUBBER key event (eraser_tool_active) as backup
-    -- 3. Otherwise use selected tool (user can toggle via gesture)
-    local TOOL_TYPE_ERASER = 2
-    local effective_tool
-    if (self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_HIGHLIGHTER) or (not self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_ERASER) or self.eraser_tool_active then
-        effective_tool = TOOL_ERASER
-        if self.input_debug_mode and slot.tool == TOOL_TYPE_ERASER then
-            self:writeDebugLog(string.format("ERASER END detected via slot.tool=%d", slot.tool))
-        end
-    else
-        effective_tool = self.current_tool
+    -- Determine effective tool: eraser role, then highlighter role (slot.tool
+    -- or side button held), then the selected tool. Same rule as the gesture path.
+    local effective_tool = self.tool:getEffectiveToolForSlot(slot, self.side_button_down)
+    if self.input_debug_mode and effective_tool == TOOL_ERASER and slot.tool == LINUX_TOOLTYPE.ERASER then
+        self:writeDebugLog(string.format("ERASER END detected via slot.tool=%d", slot.tool))
     end
 
     -- Handle eraser mode
     if effective_tool == TOOL_ERASER then
-        if self.input_debug_mode and not self.erasing then
+        if self.input_debug_mode and not self.tool.erasing then
             self:writeDebugLog(string.format("ERASER MODE: pen_down=%s slot.id=%d",
                 tostring(self.pen_down), slot.id or -1))
         end
@@ -526,7 +457,7 @@ function Pencil:handleStylusSlot(input, slot)
             local first_touch = false
             if not self.pen_down then
                 self.pen_down = true
-                self.erasing = true
+                self.tool.erasing = true
                 self.eraser_deleted = {}
                 first_touch = true
                 if self.input_debug_mode then
@@ -542,7 +473,7 @@ function Pencil:handleStylusSlot(input, slot)
                 local page = self:getCurrentPage()
                 if self.input_debug_mode then
                     self:writeDebugLog(string.format("ERASE ATTEMPT at (%d, %d) page=%s erasing=%s",
-                        x, y, tostring(page), tostring(self.erasing)))
+                        x, y, tostring(page), tostring(self.tool.erasing)))
                 end
                 local deleted = self:eraseAtPoint(x, y, page)
                 if deleted then
@@ -567,9 +498,9 @@ function Pencil:handleStylusSlot(input, slot)
             end
         else
             -- Eraser lifted
-            if self.pen_down and self.erasing then
+            if self.pen_down and self.tool.erasing then
                 self.pen_down = false
-                self.erasing = false
+                self.tool.erasing = false
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
                     table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
                     -- (Embedded-ink annotations are removed inside eraseAtPoint.)
@@ -602,10 +533,10 @@ function Pencil:handleStylusSlot(input, slot)
 
             -- Start new stroke
             self.pen_down = true
-            self.erasing = false
+            self.tool.erasing = false
             self:cancelPendingRefresh()
             self:cancelColorPickerTimer()
-            self:startRawStroke()
+            self:startRawStroke(effective_tool)
             -- Record initial position and timestamp for color picker trigger
             local raw_x = slot.x or 0
             local raw_y = slot.y or 0
@@ -650,7 +581,7 @@ function Pencil:handleStylusSlot(input, slot)
         end
     else
         -- Pen lifted (id == -1)
-        if self.pen_down and not self.erasing then
+        if self.pen_down and not self.tool.erasing then
             self.pen_down = false
             self:cancelColorPickerTimer()
             self:endRawStroke()
@@ -678,12 +609,14 @@ function Pencil:teardownStylusCallback()
 end
 
 -- Start a new stroke from raw input
-function Pencil:startRawStroke()
+function Pencil:startRawStroke(tool)
     local page = self:getCurrentPage()
-    local tool = self.side_button_down and TOOL_HIGHLIGHTER or self.current_tool
-    local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+    tool = tool or (self.side_button_down and TOOL_HIGHLIGHTER or self.tool:getTool())
+    local tool_settings = self.tool:getToolSettings(tool)
 
-    if self.side_button_down then
+    -- A highlight stroke means the side button did something: releasing it
+    -- must not count as a quick press (pen/eraser toggle)
+    if self.side_button_down or tool == TOOL_HIGHLIGHTER then
         self.side_button_used_for_highlight = true
     end
 
@@ -919,7 +852,8 @@ function Pencil:startTextHighlight(raw_x, raw_y)
         rh.selected_text = nil
     end
 
-    self.highlighting = true
+    self.tool.highlighting = true
+    self.side_button_used_for_highlight = true
     -- Prevent the drawing-path pen-down branch from also firing on subsequent
     -- events for this contact.
     self.pen_down = true
@@ -929,7 +863,7 @@ function Pencil:startTextHighlight(raw_x, raw_y)
 end
 
 -- Extend the active text-highlight selection to a new raw stylus position.
--- Called on each stylus slot update while self.highlighting is true.
+-- Called on each stylus slot update while self.tool.highlighting is true.
 function Pencil:extendTextHighlight(raw_x, raw_y)
     if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
         return
@@ -954,7 +888,7 @@ function Pencil:extendTextHighlight(raw_x, raw_y)
 end
 
 -- Persist the current selection as a KOReader highlight annotation and reset.
--- Called on slot.id transitioning to -1 (pen lift) while self.highlighting.
+-- Called on slot.id transitioning to -1 (pen lift) while self.tool.highlighting.
 function Pencil:finishTextHighlight()
     local rh = self.ui and self.ui.highlight
     local has_selection = rh and rh.selected_text
@@ -980,7 +914,7 @@ function Pencil:finishTextHighlight()
         pcall(rh.clear, rh)
     end
 
-    self.highlighting = false
+    self.tool.highlighting = false
     self.pen_down = false
 end
 
@@ -1114,71 +1048,47 @@ end
 -- Load plugin settings
 function Pencil:loadSettings()
     local settings = G_reader_settings:readSetting("pencil_annotation_settings") or {}
-    -- Always start with pencil tool when opening a book
-    self.current_tool = TOOL_PEN
     -- Input debug mode: log all input details
     self.input_debug_mode = settings.input_debug_mode or false
     -- Experimental features
     self.experimental_bookmark_sync = settings.experimental_bookmark_sync or false
-    -- Swap eraser and highlighter
-    self.swap_eraser_and_highlighter = settings.swap_eraser_and_highlighter or false
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
-    self.experimental_text_highlight = settings.experimental_text_highlight or false
     -- Auto-save pencil ink into the PDF file when the document is closed.
     self.auto_save_pdf = settings.auto_save_pdf or false
     self.myscript_language = settings.myscript_language or "en_US"
     self.myscript_application_key = settings.myscript_application_key or ""
     self.myscript_hmac_key = settings.myscript_hmac_key or ""
-    -- Load pen color by name and look up the actual color value
-    local color_name = settings.pen_color_name
-    if color_name then
-        self.tool_settings[TOOL_PEN].color_name = color_name
-        for _, color_info in ipairs(self.available_colors) do
-            if color_info.name == color_name then
-                self.tool_settings[TOOL_PEN].color = color_info.color
-                break
-            end
-        end
-    end
-    -- Load pen width if previously chosen via the experimental width picker.
-    -- Validated against available_widths so a malformed settings file can't
-    -- inject arbitrary widths.
-    local saved_width = settings.pen_width
-    if saved_width then
-        for _, w in ipairs(self.available_widths) do
-            if w.width == saved_width then
-                self.tool_settings[TOOL_PEN].width = saved_width
-                break
-            end
-        end
-    end
+    -- Tool settings: starting tool, swap eraser/highlighter, text highlight,
+    -- pen color and width (validated against available_colors/available_widths)
+    self.tool:loadSettings(settings, self.available_colors, self.available_widths)
     -- Live rendering options
     self.live_black_preview = settings.live_black_preview or false
 end
 
 -- Save plugin settings
 function Pencil:saveSettings()
-    G_reader_settings:saveSetting("pencil_annotation_settings", {
+    local settings = {
         input_debug_mode = self.input_debug_mode,
         experimental_bookmark_sync = self.experimental_bookmark_sync,
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
-        experimental_text_highlight = self.experimental_text_highlight,
         auto_save_pdf = self.auto_save_pdf,
         myscript_language = self.myscript_language,
         myscript_application_key = self.myscript_application_key,
         myscript_hmac_key = self.myscript_hmac_key,
-        pen_color_name = self.tool_settings[TOOL_PEN].color_name,
-        swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
-        pen_width = self.tool_settings[TOOL_PEN].width,
         live_black_preview = self.live_black_preview,
-    })
+    }
+    -- swap_eraser_and_highlighter, experimental_text_highlight, pen_color_name, pen_width
+    for key, value in pairs(self.tool:exportSettings()) do
+        settings[key] = value
+    end
+    G_reader_settings:saveSetting("pencil_annotation_settings", settings)
 end
 
 -- Set current tool
 function Pencil:setTool(tool)
-    self.current_tool = tool
+    self.tool:setTool(tool)
     self:saveSettings()
 end
 
@@ -1220,10 +1130,10 @@ function Pencil:addToMainMenu(menu_items)
             {
                 text = _("Swap Eraser and Highlighter"),
                 checked_func = function()
-                    return self.swap_eraser_and_highlighter
+                    return self.tool:isSwaped()
                 end,
                 callback = function()
-                    self.swap_eraser_and_highlighter = not self.swap_eraser_and_highlighter
+                    self.tool:swapEraserHighlighter()
                     self:saveSettings()
                 end,
                 separator = true,
@@ -1235,7 +1145,7 @@ function Pencil:addToMainMenu(menu_items)
                     {
                         text = _("Pencil"),
                         checked_func = function()
-                            return self.current_tool == TOOL_PEN
+                            return self.tool:getTool() == TOOL_PEN
                         end,
                         callback = function()
                             self:setTool(TOOL_PEN)
@@ -1244,7 +1154,7 @@ function Pencil:addToMainMenu(menu_items)
                     {
                         text = _("Eraser"),
                         checked_func = function()
-                            return self.current_tool == TOOL_ERASER
+                            return self.tool:getTool() == TOOL_ERASER
                         end,
                         callback = function()
                             self:setTool(TOOL_ERASER)
@@ -1382,12 +1292,12 @@ function Pencil:addToMainMenu(menu_items)
                         text = _("Text highlight (side button)"),
                         help_text = _("When enabled, holding the stylus side button during a pen drag creates a native KOReader text highlight on the underlying words, like a long-press \xe2\x86\x92 Highlight. Off by default because this is a new integration and has edge cases. Requires a stylus that sends BTN_STYLUS2."),
                         checked_func = function()
-                            return self.experimental_text_highlight
+                            return self.tool:isExperimentalTextHighlight()
                         end,
                         callback = function()
-                            self.experimental_text_highlight = not self.experimental_text_highlight
+                            self.tool:experimentalTextHighlight()
                             self:saveSettings()
-                            if self.experimental_text_highlight then
+                            if self.tool:isExperimentalTextHighlight() then
                                 UIManager:show(InfoMessage:new{
                                     text = _("Text highlight enabled. Hold the side button while dragging the pen across words."),
                                     timeout = 3,
@@ -1575,7 +1485,7 @@ Side button: tap to toggle pen/eraser, hold+drag to highlight.
 Enable "Input debug mode" to log raw events for diagnosis.
 
 Pages with strokes:%8]]),
-        self.current_tool,
+        self.tool:getTool(),
         #self.strokes,
         page_strokes,
         tostring(page),
@@ -1601,7 +1511,10 @@ function Pencil:onStylusButtonPress()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     self.side_button_down = true
-    self.side_button_used_for_highlight = false
+    -- The slot event can arrive before this key press: don't forget a
+    -- highlight (stroke or text) that is already under way.
+    self.side_button_used_for_highlight = self.tool.highlighting
+        or (self.current_stroke ~= nil and self.current_stroke.tool == TOOL_HIGHLIGHTER)
 
     logger.dbg("Pencil: side button pressed")
     return true
@@ -1621,7 +1534,7 @@ function Pencil:onStylusButtonRelease()
         self:togglePenEraser()
     else
         -- Was used for highlighting - show brief feedback that we're back to normal
-        logger.dbg("Pencil: highlight complete, back to", self.current_tool)
+        logger.dbg("Pencil: highlight complete, back to", self.tool:getTool())
     end
 
     self.side_button_used_for_highlight = false
@@ -1630,20 +1543,25 @@ end
 
 -- Toggle between pen and eraser
 function Pencil:togglePenEraser()
-    local old_tool = self.current_tool
-    local new_tool
-    if self.current_tool == TOOL_ERASER then
-        new_tool = TOOL_PEN
-    else
-        new_tool = TOOL_ERASER
-    end
-
-    self.current_tool = new_tool
+    self.tool:togglePenEraser()
     self:saveSettings()
-    logger.dbg("Pencil: toggled from", old_tool, "to", new_tool)
 end
 
--- Handle stylus button and tool events
+-- Eraser mode ended (eraser end lifted or eraser button released): push what
+-- it deleted onto the undo stack and repaint.
+function Pencil:endEraserMode()
+    if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+        table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+        self:saveStrokes()
+    end
+    self.eraser_button_deleted = nil
+    UIManager:setDirty(self.view, "ui")
+end
+
+-- Handle stylus button and tool events.
+-- What a physical input does (erase / highlight) is decided by PencilTool, so
+-- the swap eraser/highlighter option applies the same way to key press, key
+-- release and raw stylus slots.
 function Pencil:onKeyPress(key)
     -- Some Kobo key/Event objects have a __tostring that errors on nil fields;
     -- guard so a stray key event can't abort this handler mid-eraser-gesture.
@@ -1655,43 +1573,41 @@ function Pencil:onKeyPress(key)
         self:writeDebugLog(string.format("KEY PRESS: %s key.key=%s", key_str, tostring(key.key)))
     end
 
-    -- Hardware Eraser button - works regardless of pencil enabled state
-    if (not self.swap_eraser_and_highlighter and key.key == "Eraser") then
-        logger.info("Pencil: Eraser button PRESSED")
-        self.eraser_button_active = true
-        self.eraser_button_deleted = {}
-        return true
-    end
+    local role, input = self.tool:roleForKey(key.key, key_str)
 
-    -- BTN_TOOL_RUBBER - physical eraser end - works regardless of pencil enabled state
-    if (self.swap_eraser_and_highlighter and (key_str:match("Highlighter") or key_str:match("Stylus"))) or (not self.swap_eraser_and_highlighter and (key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber"))) then
-        logger.info("Pencil: BTN_TOOL_RUBBER press - activating eraser mode")
-        self.eraser_button_active = true
+    -- Eraser role (eraser end/button, or the side button when swapped) -
+    -- works regardless of pencil enabled state
+    if role == TOOL_ERASER then
+        logger.info("Pencil: eraser input PRESSED:", input)
+        self.tool.eraser_button_active = true
         self.eraser_button_deleted = {}
-        self.eraser_tool_active = true
+        if input == PencilTool.INPUT.RUBBER then
+            -- BTN_TOOL_RUBBER: the eraser end itself, stays until it leaves
+            self.tool.eraser_tool_active = true
+        end
         return true
     end
 
     -- BTN_TOOL_PEN - pen tip - deactivate eraser mode
     if key_str:match("BTN_TOOL_PEN") or key_str:match("ToolPen") then
         logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
-        if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
+        if self.tool.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
-        self.eraser_button_active = false
+        self.tool.eraser_button_active = false
         self.eraser_button_deleted = nil
-        self.eraser_tool_active = false
+        self.tool.eraser_tool_active = false
         return true
     end
 
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- BTN_STYLUS (331) - side button on stylus (mapped to "Eraser" on Kobo)
-    -- BTN_STYLUS2 (332) - second side button (mapped to "Highlighter" on Kobo)
-    if (self.swap_eraser_and_highlighter and key.key == "Eraser") or (not self.swap_eraser_and_highlighter and (key_str:match("Highlighter") or key_str:match("Stylus"))) then
-        logger.dbg("Pencil: Stylus button press detected:", key_str)
+    -- Highlighter role (side button, or the eraser end/button when swapped):
+    -- hold+drag highlights, a quick press toggles pen/eraser
+    if role == TOOL_HIGHLIGHTER then
+        logger.dbg("Pencil: highlighter input press detected:", key_str)
         return self:onStylusButtonPress()
     end
     return false
@@ -1706,31 +1622,23 @@ function Pencil:onKeyRelease(key)
         self:writeDebugLog(string.format("KEY RELEASE: %s key.key=%s", key_str, tostring(key.key)))
     end
 
-    -- Hardware Eraser button released
-    if key.key == "Eraser" and self.eraser_button_active then
-        logger.info("Pencil: Eraser button RELEASED")
-        self.eraser_button_active = false
-        if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
-        end
-        self.eraser_button_deleted = nil
-        UIManager:setDirty(self.view, "ui")
-        return true
-    end
+    local role, input = self.tool:roleForKey(key.key, key_str)
 
-    -- BTN_TOOL_RUBBER released (eraser end moved away) - works regardless of pencil enabled state
-    if key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber") then
-        logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
-        if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
-            self:saveStrokes()
+    -- Eraser role released - works regardless of pencil enabled state
+    if role == TOOL_ERASER then
+        if input == PencilTool.INPUT.RUBBER then
+            -- BTN_TOOL_RUBBER released (eraser end moved away)
+            logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
+            self.tool.eraser_button_active = false
+            self.tool.eraser_tool_active = false
+            self:endEraserMode()
+            return true
+        elseif self.tool.eraser_button_active then
+            logger.info("Pencil: eraser input RELEASED:", input)
+            self.tool.eraser_button_active = false
+            self:endEraserMode()
+            return true
         end
-        self.eraser_button_active = false
-        self.eraser_button_deleted = nil
-        self.eraser_tool_active = false
-        UIManager:setDirty(self.view, "ui")
-        return true
     end
 
     -- BTN_TOOL_PEN released
@@ -1741,9 +1649,9 @@ function Pencil:onKeyRelease(key)
 
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- Side button released
-    if key_str:match("Highlighter") or key_str:match("Stylus") then
-        logger.dbg("Pencil: Stylus button release detected:", key_str)
+    -- Highlighter role released
+    if role == TOOL_HIGHLIGHTER then
+        logger.dbg("Pencil: highlighter input release detected:", key_str)
         return self:onStylusButtonRelease()
     end
     return false
@@ -2612,8 +2520,8 @@ function Pencil:showColorPicker(x, y)
     local color_picker = ColorPickerWidget:new{
         colors = colors_for_picker,
         widths = widths_for_picker,
-        current_color_name = self.tool_settings[TOOL_PEN].color_name,
-        current_width = self.tool_settings[TOOL_PEN].width,
+        current_color_name = self.tool:getSettings().color_name,
+        current_width = self.tool:getSettings().width,
         callback = function(color_value, color_name, width_value)
             -- Width taps are routed through width_value; color taps leave it nil.
             -- This avoids the string-match ambiguity the earlier prototype had.
@@ -2663,8 +2571,7 @@ end
 
 -- Set pen color
 function Pencil:setPenColor(color, color_name)
-    self.tool_settings[TOOL_PEN].color = color
-    self.tool_settings[TOOL_PEN].color_name = color_name
+    self.tool:setColor(color_name, color)
     logger.info("Pencil: setPenColor - color_name =", color_name)
     self:saveSettings()
 end
@@ -2672,7 +2579,7 @@ end
 -- Set pen width. Only callable while experimental_pen_width is on
 -- (the picker is the only UI path that invokes this).
 function Pencil:setPenWidth(width)
-    self.tool_settings[TOOL_PEN].width = width
+    self.tool:setWidth(width)
     logger.info("Pencil: setPenWidth - width =", width)
     self:saveSettings()
 end
@@ -2685,7 +2592,7 @@ function Pencil:onDrawTouch(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     -- Check if this is a finger touch (not pen) - let gesture system handle it
-    local is_pen, _ = self:isPenInput(ges)
+    local is_pen, is_eraser_end, is_highlighter = self:isPenInput(ges)
     if not is_pen then
         return false
     end
@@ -2698,14 +2605,10 @@ function Pencil:onDrawTouch(ges)
         return true
     end
 
-    -- Fallback: check pen input via gesture system's slot data
-    local is_pen, is_eraser_end, is_highlighter = self:isPenInput(ges)
-    if not is_pen then return false end
-
     -- Cancel any pending refresh - user is still writing
     self:cancelPendingRefresh()
 
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
 
     -- For eraser, we handle in pan (need movement to erase)
     if effective_tool == TOOL_ERASER then
@@ -2721,7 +2624,7 @@ function Pencil:onDrawTouch(ges)
     end
 
     -- Start new stroke immediately with first point
-    local tool_settings = self.tool_settings[effective_tool] or self.tool_settings[TOOL_PEN]
+    local tool_settings = self.tool:getToolSettings(effective_tool)
     self.current_stroke = {
         page = page,
         tool = effective_tool,
@@ -2741,7 +2644,7 @@ function Pencil:onDrawTouch(ges)
 
     if self.live_black_preview
         and effective_tool == TOOL_PEN
-        and self.tool_settings[TOOL_PEN].color_name ~= "Black" then
+        and self.tool:getSettings().color_name ~= "Black" then
         color = Blitbuffer.COLOR_BLACK
     end
     local half_w = math.floor(width / 2)
@@ -2762,37 +2665,18 @@ function Pencil:isPenInput(ges)
         return false, false, false
     end
 
-    local TOOL_TYPE_PEN = 1
-    local TOOL_TYPE_ERASER = 2
-    local TOOL_TYPE_HIGHLIGHTER = 3
-
     local pen_slot_data = Input:getMtSlot(Input.pen_slot)
     if pen_slot_data and pen_slot_data.id and pen_slot_data.id ~= -1 then
-        if pen_slot_data.tool == TOOL_TYPE_PEN then
+        if pen_slot_data.tool == LINUX_TOOLTYPE.PEN then
             return true, false, false
-        elseif pen_slot_data.tool == TOOL_TYPE_ERASER then
+        elseif pen_slot_data.tool == LINUX_TOOLTYPE.ERASER then
             return true, true, false
-        elseif pen_slot_data.tool == TOOL_TYPE_HIGHLIGHTER then
+        elseif pen_slot_data.tool == LINUX_TOOLTYPE.HIGHLIGHTER then
             return true, false, true
         end
     end
 
     return false, false, false
-end
-
--- Get the effective tool (considers physical eraser end and side button)
-function Pencil:getEffectiveTool(is_eraser_end, is_highlighter)
-    -- Check both the tool type detection AND the BTN_TOOL_RUBBER state
-    if self.eraser_tool_active or ((self.swap_eraser_and_highlighter and is_highlighter) or (not self.swap_eraser_and_highlighter and is_eraser_end)) then
-        return TOOL_ERASER
-    end
-
-    -- Side button held = highlighter mode (for hold+drag highlighting)
-    if self.side_button_down or ((self.swap_eraser_and_highlighter and is_eraser_end) or (not self.swap_eraser_and_highlighter and is_highlighter)) then
-        return TOOL_HIGHLIGHTER
-    end
-
-    return self.current_tool
 end
 
 -- Find the topmost visible pencil annotation group at a screen position.
@@ -2917,13 +2801,13 @@ function Pencil:onDrawTap(ges)
     end
 
     local page = self:getCurrentPage()
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
     logger.dbg("Pencil: onDrawTap - effective_tool =", effective_tool)
 
     -- Log to debug file for analysis
     self:writeDebugLog(string.format("=== TAP at (%d, %d) ===", ges.pos.x, ges.pos.y))
     self:writeDebugLog(string.format("  is_eraser_end=%s eraser_tool_active=%s effective_tool=%s",
-        tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
+        tostring(is_eraser_end), tostring(self.tool.eraser_tool_active), effective_tool))
 
     if effective_tool == TOOL_ERASER then
         -- Eraser: delete strokes near tap point
@@ -2941,7 +2825,7 @@ function Pencil:onDrawTap(ges)
     end
 
     -- Pen or Highlighter: create a dot
-    local tool_settings = self.tool_settings[effective_tool] or self.tool_settings[TOOL_PEN]
+    local tool_settings = self.tool:getToolSettings(effective_tool)
     local stroke = {
         page = page,
         tool = effective_tool,
@@ -2986,7 +2870,7 @@ function Pencil:onDrawPan(ges)
     if not is_pen then return false end
 
     local page = self:getCurrentPage()
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
 
     -- If side button is held and we're drawing, mark it as used for highlighting
     if self.side_button_down and effective_tool == TOOL_HIGHLIGHTER then
@@ -3016,7 +2900,7 @@ function Pencil:onDrawPan(ges)
     end
 
     -- Fallback: handle via gesture system if raw input not working
-    local tool_settings = self.tool_settings[effective_tool] or self.tool_settings[TOOL_PEN]
+    local tool_settings = self.tool:getToolSettings(effective_tool)
 
     -- Stroke should already exist from onDrawTouch, but handle fallback cases
     if not self.current_stroke or self.current_stroke.page ~= page or self.current_stroke.tool ~= effective_tool then
@@ -3077,12 +2961,12 @@ function Pencil:onDrawPanRelease(ges)
         return false
     end
 
-    local effective_tool = self:getEffectiveTool(is_eraser_end, is_highlighter)
+    local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
 
     -- Log pan end to debug file
     self:writeDebugLog(string.format("=== PAN END at (%d, %d) ===", ges.pos.x, ges.pos.y))
     self:writeDebugLog(string.format("  is_eraser_end=%s eraser_tool_active=%s effective_tool=%s",
-        tostring(is_eraser_end), tostring(self.eraser_tool_active), effective_tool))
+        tostring(is_eraser_end), tostring(self.tool.eraser_tool_active), effective_tool))
 
     -- Handle eraser pan release (raw input doesn't handle eraser)
     if effective_tool == TOOL_ERASER then
@@ -4026,8 +3910,8 @@ function Pencil:renderStrokeOffset(bb, stroke, dx, dy)
     if not stroke or not stroke.points or #stroke.points < 1 then return end
 
     local tool = stroke.tool or TOOL_PEN
-    local width = stroke.width or self.tool_settings[tool].width or 3
-    local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
+    local width = stroke.width or self.tool:getToolSettings(tool).width or 3
+    local color = stroke.color or self.tool:getToolSettings(tool).color or Blitbuffer.COLOR_BLACK
 
     if Screen.night_mode and stroke.color_name ~= "Black" and stroke.color_name ~= "Gray" then
         color = color:invert()
@@ -4293,24 +4177,6 @@ function Pencil:findGroupBadgeAtPoint(x, y)
     return nil
 end
 
--- Called by the bookmark-list hook on menu select. Returns true if we
--- handled the tap (and the original navigation should be skipped).
-function Pencil:tryShowImageForBookmark(item)
-    if not item or not item.datetime then return false end
-    if not item.datetime:match("^pencil_") then return false end
-    -- Find the matching group by id (group.id is stored as the bookmark datetime).
-    for _, group in ipairs(self.annotation_groups or {}) do
-        if group.id == item.datetime then
-            if group.image_path then
-                self:showGroupImagePreview(group)
-                return true
-            end
-            return false  -- pencil bookmark but no image yet; fall through to navigate
-        end
-    end
-    return false
-end
-
 -- Total disk usage of pencil_images/ for the current document, in bytes.
 function Pencil:getImagesSizeBytes()
     local dir = self:getImagesDir()
@@ -4533,9 +4399,9 @@ end
 -- centered on the path, so no extra halving is needed.)
 function Pencil:strokeToInkOpts(stroke)
     local tool = stroke.tool or TOOL_PEN
-    local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
+    local color = stroke.color or self.tool:getToolSettings(tool).color or Blitbuffer.COLOR_BLACK
     local rgb = color:getColorRGB32()
-    local width = stroke.width or self.tool_settings[tool].width or 3
+    local width = stroke.width or self.tool:getToolSettings(tool).width or 3
     local zoom = self.view and self.view.state and self.view.state.zoom
     if zoom and zoom > 0 then
         width = width / zoom
@@ -5147,7 +5013,7 @@ function Pencil:erasedStrokesRefreshRect(strokes)
         end
     end
     if not bbox then return nil end
-    local margin = (self.tool_settings[TOOL_ERASER] and self.tool_settings[TOOL_ERASER].width) or 20
+    local margin = self.tool:getToolSettings(TOOL_ERASER).width or 20
     bbox = PencilGeometry.bboxExpand(bbox, margin)
     bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
     local w = bbox.x1 - bbox.x0
@@ -5172,7 +5038,7 @@ function Pencil:eraseAtPoint(x, y, page)
         return nil
     end
 
-    local eraser_width = self.tool_settings[TOOL_ERASER].width
+    local eraser_width = self.tool:getToolSettings(TOOL_ERASER).width
     local deleted = {}
     local indices_to_remove = {}
 
@@ -5236,10 +5102,10 @@ function Pencil:renderStroke(bb, stroke)
     end
 
     local tool = stroke.tool or TOOL_PEN
-    local width = stroke.width or self.tool_settings[tool].width or 3
+    local width = stroke.width or self.tool:getToolSettings(tool).width or 3
 
     -- Get color directly (it's already a Blitbuffer color)
-    local color = stroke.color or self.tool_settings[tool].color or Blitbuffer.COLOR_BLACK
+    local color = stroke.color or self.tool:getToolSettings(tool).color or Blitbuffer.COLOR_BLACK
 
     -- Reinvert color in night mode (if it's not black or gray)
     if Screen.night_mode and stroke.color_name ~= "Black" and stroke.color_name ~= "Gray" then
@@ -5532,7 +5398,7 @@ end
 -- Convert saved stroke back to usable format
 function Pencil:strokeFromSaved(saved)
     local tool = saved.tool or TOOL_PEN
-    local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+    local tool_settings = self.tool:getToolSettings(tool)
 
     -- Look up color from color_name
     local color = tool_settings.color
