@@ -6,7 +6,16 @@ Owns everything that answers "which tool is the stylus acting as right now?":
     (width, color, alpha),
   * the eraser state (eraser end of the stylus, hardware eraser button),
   * the text-highlight mode state,
-  * the swap-eraser-and-highlighter option.
+  * the swap-eraser-and-highlighter option,
+  * what a stylus contact means: a click or a drag with the eraser role, text
+    or freehand highlight with the highlighter role.
+
+How the stylus behaves (roles are exchanged by the swap option):
+  * pen tip: the selected tool (pen or eraser);
+  * eraser role (eraser end by default): a click (touch that stays put) toggles
+    the selected tool, a drag erases what it passes over and does NOT toggle;
+  * highlighter role (side button by default): dragging highlights the text
+    below the pen, or, if there is no text below it, draws a highlighter stroke.
 
 It does NOT touch strokes, the screen, KOReader widgets, Dispatcher events or
 G_reader_settings. main.lua feeds it settings (loadSettings) and reads them back
@@ -43,6 +52,26 @@ PencilTool.INPUT = {
     SIDE_KEY = "side_key",      -- BTN_STYLUS2, key "Highlighter"/"Stylus" (side button); slot.tool HIGHLIGHTER
 }
 
+-- Opacities (percent) offered for the highlighter. 100 = the color as is, lower
+-- values let more of the page show through.
+PencilTool.HIGHLIGHTER_OPACITIES = { 20, 35, 50, 65, 80, 100 }
+PencilTool.DEFAULT_HIGHLIGHTER_OPACITY = 65
+-- The highlighter color is chosen by name from the plugin's color list. "Gray"
+-- at 65% reproduces the light gray the highlighter always had.
+PencilTool.DEFAULT_HIGHLIGHTER_COLOR_NAME = "Gray"
+
+-- Opacity percent <-> alpha byte (0-255, the value stored in strokes)
+function PencilTool.opacityToAlpha(percent)
+    return math.floor(255 * percent / 100 + 0.5)
+end
+
+function PencilTool.alphaToOpacity(alpha)
+    return math.floor((alpha or 255) * 100 / 255 + 0.5)
+end
+
+-- A contact that moves less than this many pixels is a click, not a drag.
+PencilTool.CLICK_TOLERANCE = 10
+
 local TOOLS = PencilTool.TOOLS
 local LINUX_TOOLTYPE = PencilTool.LINUX_TOOLTYPE
 local INPUT = PencilTool.INPUT
@@ -68,6 +97,13 @@ function PencilTool:init()
     -- KOReader text-highlight selection via ReaderHighlight. Sticky through
     -- pen lift so releasing the side button mid-drag doesn't abort.
     self.highlighting = false
+    -- The highlighter contact in progress found no text below the pen and is
+    -- drawn as a freehand highlighter stroke (decided once per contact)
+    self.highlight_freehand = false
+    -- Eraser-role contact in progress: { x0, y0, dragging }; nil when none
+    self.eraser_contact = nil
+    -- Whether the screen was touched since the eraser role was activated
+    self.eraser_touched = false
 
     -- Per-tool settings
     self.tool_settings = {
@@ -79,8 +115,9 @@ function PencilTool:init()
         },
         [TOOLS.HIGHLIGHTER] = {
             width = 20,
-            color = Blitbuffer.Color8(0xDD),  -- Light gray for e-ink
-            alpha = 128,
+            color = Blitbuffer.Color8(0xCC),
+            color_name = PencilTool.DEFAULT_HIGHLIGHTER_COLOR_NAME,
+            alpha = PencilTool.opacityToAlpha(PencilTool.DEFAULT_HIGHLIGHTER_OPACITY),
         },
         [TOOLS.ERASER] = {
             width = 20,
@@ -130,6 +167,23 @@ function PencilTool:loadSettings(settings, available_colors, available_widths)
         pen.color_name = "Black"
     end
 
+    -- Highlighter color (by name) and opacity (one of the offered percentages)
+    local hl = self.tool_settings[TOOLS.HIGHLIGHTER]
+    local hl_name = settings.highlighter_color_name or PencilTool.DEFAULT_HIGHLIGHTER_COLOR_NAME
+    for _, color_info in ipairs(available_colors or {}) do
+        if color_info.name == hl_name then
+            hl.color_name = color_info.name
+            hl.color = color_info.color
+            break
+        end
+    end
+    for _, percent in ipairs(PencilTool.HIGHLIGHTER_OPACITIES) do
+        if percent == settings.highlighter_opacity then
+            hl.alpha = PencilTool.opacityToAlpha(percent)
+            break
+        end
+    end
+
     local saved_width = settings.pen_width
     if saved_width then
         for _, w in ipairs(available_widths or {}) do
@@ -144,11 +198,14 @@ end
 -- The tool-related keys main.lua merges into the plugin settings it saves.
 function PencilTool:exportSettings()
     local pen = self.tool_settings[TOOLS.PEN]
+    local hl = self.tool_settings[TOOLS.HIGHLIGHTER]
     return {
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         experimental_text_highlight = self.experimental_text_highlight,
         pen_color_name = pen.color_name,
         pen_width = pen.width,
+        highlighter_color_name = hl.color_name,
+        highlighter_opacity = PencilTool.alphaToOpacity(hl.alpha),
     }
 end
 
@@ -164,6 +221,28 @@ end
 
 function PencilTool:setWidth(width)
     self.tool_settings[TOOLS.PEN].width = width
+end
+
+function PencilTool:setHighlighterColor(name, color)
+    local hl = self.tool_settings[TOOLS.HIGHLIGHTER]
+    hl.color_name = name
+    hl.color = color
+end
+
+-- percent: one of HIGHLIGHTER_OPACITIES. Returns false (and changes nothing)
+-- for any other value.
+function PencilTool:setHighlighterOpacity(percent)
+    for _, allowed in ipairs(PencilTool.HIGHLIGHTER_OPACITIES) do
+        if allowed == percent then
+            self.tool_settings[TOOLS.HIGHLIGHTER].alpha = PencilTool.opacityToAlpha(percent)
+            return true
+        end
+    end
+    return false
+end
+
+function PencilTool:getHighlighterOpacity()
+    return PencilTool.alphaToOpacity(self.tool_settings[TOOLS.HIGHLIGHTER].alpha)
 end
 
 -- Pen settings
@@ -321,50 +400,135 @@ function PencilTool:getEffectiveTool(is_eraser_end, is_highlighter, side_button_
     return self.current_tool
 end
 
+-- Enter eraser mode (eraser role pressed or touching). rubber: the eraser end
+-- itself (BTN_TOOL_RUBBER), which also stays flagged until it leaves.
+-- Returns true if eraser mode was just entered, false if it already was on
+-- (the slot event usually arrives before the key event).
+function PencilTool:activateEraser(rubber)
+    if rubber then
+        self.eraser_tool_active = true
+    end
+    if self.eraser_button_active then
+        return false
+    end
+    self.eraser_button_active = true
+    self.eraser_contact = nil
+    self.eraser_touched = false
+    return true
+end
+
+-- Leave eraser mode. button_input: the eraser role was a real button (the side
+-- button when swapped), for which pressing and releasing it without touching
+-- the screen is a click too. Returns true if the activation amounted to a
+-- click, i.e. the caller should toggle the tool.
+function PencilTool:deactivateEraser(button_input)
+    local clicked = false
+    if self.eraser_contact then
+        -- Contact still in progress when the eraser role ended: counts as lifted
+        clicked = not self.eraser_contact.dragging
+    elseif button_input and not self.eraser_touched then
+        clicked = true
+    end
+    self.eraser_button_active = false
+    self.eraser_contact = nil
+    self.eraser_touched = false
+    return clicked
+end
+
+-- Follow one eraser-role contact. active: the pen touches (slot.id >= 0), x/y
+-- its screen position. Returns the phase:
+--   "down"       contact started (nothing to erase yet: it may be a click)
+--   "hold"       still within the click tolerance (nothing to erase)
+--   "drag_start" moved beyond the tolerance: it is a drag, erase from now on
+--                (the caller also erases at contact.x0/y0, see eraser_contact)
+--   "drag"       drag continues: erase here
+--   "drag_end"   lifted after a drag (nothing to do, must not toggle)
+--   "click"      lifted without dragging: toggle the tool
+--   nil          no contact in progress and none starting
+function PencilTool:trackEraserContact(active, x, y)
+    local contact = self.eraser_contact
+    if active then
+        if not contact then
+            self.eraser_contact = { x0 = x, y0 = y, dragging = false }
+            self.eraser_touched = true
+            return "down"
+        end
+        if contact.dragging then
+            return "drag"
+        end
+        local dx, dy = x - contact.x0, y - contact.y0
+        if dx * dx + dy * dy > PencilTool.CLICK_TOLERANCE * PencilTool.CLICK_TOLERANCE then
+            contact.dragging = true
+            return "drag_start"
+        end
+        return "hold"
+    end
+    if contact then
+        self.eraser_contact = nil
+        return contact.dragging and "drag_end" or "click"
+    end
+    return nil
+end
+
 -- Detect eraser mode from slot.tool BEFORE the key events arrive (the stylus
 -- callback fires before them) and update eraser_button_active.
--- Returns true when eraser mode was just activated, false when it was just
--- deactivated (eraser end switched back to the pen tip), nil if unchanged.
+-- Returns true when eraser mode was just activated; false when it was just
+-- deactivated (eraser end switched back to the pen tip), followed by whether
+-- that amounted to a click (see deactivateEraser); nil if unchanged.
 -- Whatever has to happen next (resetting/flushing the list of erased strokes,
--- repainting) is up to the caller.
+-- toggling the tool, repainting) is up to the caller.
 function PencilTool:detectEraserAndUpdate(slot)
     local is_eraser = self:isEraserToolType(slot)
     if is_eraser and not self.eraser_button_active then
         logger.info("PencilTool: Eraser end detected via slot.tool, activating eraser mode")
-        self.eraser_button_active = true
+        self:activateEraser()
         return true
     elseif not is_eraser and self.eraser_button_active then
         -- Switched from eraser end to pen tip
         logger.info("PencilTool: Pen tip detected via slot.tool, deactivating eraser mode")
-        self.eraser_button_active = false
-        return false
+        return false, self:deactivateEraser(false)
     end
 
     return nil
 end
 
--- Decide whether a stylus slot belongs to a native text highlight (side button
--- + drag) and which step it is. Does not change any state: `highlighting` is
--- set by the caller once a highlight has really started (it can't start e.g.
--- while the pen is outside any page area) and cleared when it ends.
--- Returns nil if the slot is not a text-highlight event (the caller should
--- carry on with the normal draw/erase handling), otherwise one of
---   "start"  - contact began, no highlight in progress
---   "extend" - contact moved, highlight in progress
---   "finish" - contact lifted, highlight in progress
---   "ignore" - belongs to text highlighting but needs no action (pen lifted
---              without a highlight in progress); still consumed by the caller
-function PencilTool:detectHighlighting(slot)
-    if not self.experimental_text_highlight then return nil end
-    if not (self.highlighting or self:isHighlightingToolType(slot)) then return nil end
+-- Highlighter role: highlight the text below the pen, or draw a highlighter
+-- stroke if there is none. Decided once per contact, when it starts.
+-- Decide what a stylus slot means for that. Changes no state itself: the caller
+-- sets `highlighting` once a text highlight has really started (it can't when
+-- there is no word below the pen) and `highlight_freehand` otherwise.
+-- Returns nil if the slot is not part of a text highlight (carry on with the
+-- normal draw/erase handling, which draws the freehand stroke), otherwise
+--   "start"  - contact began, no decision yet: try a text highlight; if there
+--              is no text below the pen set highlight_freehand = true and
+--              carry on with the normal handling
+--   "extend" - contact moved, text highlight in progress
+--   "finish" - contact lifted, text highlight in progress
+--   "ignore" - pen lifted, nothing in progress; nothing to do
+function PencilTool:detectHighlighting(slot, side_button_down)
+    if not self.experimental_text_highlight then
+        self.highlight_freehand = false
+        return nil
+    end
+    local engaged = self.highlighting or self.highlight_freehand
+    if not engaged and self:getEffectiveToolForSlot(slot, side_button_down) ~= TOOLS.HIGHLIGHTER then
+        return nil
+    end
 
-    local contact = (slot.id or -1) >= 0
-    if contact and not self.highlighting then
+    if (slot.id or -1) >= 0 then
+        if self.highlighting then
+            return "extend"
+        elseif self.highlight_freehand then
+            return nil
+        end
         return "start"
-    elseif contact then
-        return "extend"
-    elseif self.highlighting then
+    end
+
+    if self.highlighting then
         return "finish"
+    elseif self.highlight_freehand then
+        self.highlight_freehand = false  -- freehand contact lifted
+        return nil
     end
     return "ignore"
 end

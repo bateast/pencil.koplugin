@@ -15,9 +15,10 @@ If you resize your book while reading it, your annotations will be WONKY. This i
 ## Features
 
 - **Pen tip**: Draw annotations on your ebooks
-- **Eraser end**: Flip your stylus over to erase strokes instantly
-- **Highlighter**: Hold the stylus side button and drag to highlight; tap the side button to toggle pencil/eraser
-- **Swap Eraser/Highlighter**: Reassign which side button acts as eraser vs. highlighter from the menu
+- **Pen tip**: draws, or erases if the eraser is the selected tool
+- **Eraser end**: click it (touch without moving) to switch the pen tip between pen and eraser; drag it to erase the strokes it passes over (this does not switch the tool)
+- **Highlighter** (side button): hold it and drag to highlight the text under the pen; where there is no text under the pen it draws a highlighter stroke instead. Choose its color and opacity in the Pencil menu under **Highlighter**; the stroke is blended into the page, so the text underneath stays readable. With the color picker option on, **hold the highlighter still** (over text or not) to open the same picker box as for the pen: a row of colors and a row of opacities. The text highlight needs the "Text highlight" option; without it the side button always draws the stroke
+- **Swap Eraser/Highlighter**: exchanges the two roles: the side button then erases (click it to switch pen/eraser, drag to erase) and the eraser end highlights
 - **Undo**: Undo your last stroke or eraser action
 - **Clear strokes**: Clear annotations for the current page or the entire document
 - **Annotation grouping**: Strokes are automatically grouped into logical annotations based on timing and proximity

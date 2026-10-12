@@ -138,11 +138,94 @@ describe("PencilTool", function()
                 experimental_text_highlight = true,
                 pen_color_name = "Red",
                 pen_width = 5,
+                highlighter_color_name = "Gray",
+                highlighter_opacity = 65,
             }, saved)
 
             local other = PencilTool:new()
             other:loadSettings(saved, colors, widths)
             assert.same(saved, other:exportSettings())
+        end)
+    end)
+
+    describe("highlighter color and opacity", function()
+        local colors = {
+            { name = "Black", color = "BLACK" },
+            { name = "Yellow", color = "YELLOW" },
+            { name = "Gray", color = "GRAYLIST" },
+        }
+
+        it("defaults to a light gray at 65%, like the highlighter always looked", function()
+            local hl = tool:getToolSettings(TOOLS.HIGHLIGHTER)
+            assert.equals("Gray", hl.color_name)
+            assert.equals(65, tool:getHighlighterOpacity())
+            assert.equals(166, hl.alpha)
+        end)
+
+        it("converts between opacity percent and alpha", function()
+            assert.equals(255, PencilTool.opacityToAlpha(100))
+            assert.equals(128, PencilTool.opacityToAlpha(50))
+            for _, pct in ipairs(PencilTool.HIGHLIGHTER_OPACITIES) do
+                assert.equals(pct, PencilTool.alphaToOpacity(PencilTool.opacityToAlpha(pct)))
+            end
+            assert.equals(100, PencilTool.alphaToOpacity(nil))
+        end)
+
+        it("sets color and opacity", function()
+            tool:setHighlighterColor("Yellow", "YELLOW")
+            assert.is_true(tool:setHighlighterOpacity(35))
+            local hl = tool:getToolSettings(TOOLS.HIGHLIGHTER)
+            assert.equals("YELLOW", hl.color)
+            assert.equals("Yellow", hl.color_name)
+            assert.equals(35, tool:getHighlighterOpacity())
+        end)
+
+        it("only accepts the offered opacities", function()
+            assert.is_false(tool:setHighlighterOpacity(42))
+            assert.is_false(tool:setHighlighterOpacity(0))
+            assert.is_false(tool:setHighlighterOpacity("50"))
+            assert.equals(65, tool:getHighlighterOpacity())
+        end)
+
+        it("does not touch the pen when the highlighter changes", function()
+            tool:setHighlighterColor("Yellow", "YELLOW")
+            assert.equals("Black", tool:getSettings().color_name)
+            assert.equals(255, tool:getSettings().alpha)
+        end)
+
+        it("round-trips through settings", function()
+            tool:setHighlighterColor("Yellow", "YELLOW")
+            tool:setHighlighterOpacity(80)
+            local saved = tool:exportSettings()
+            assert.equals("Yellow", saved.highlighter_color_name)
+            assert.equals(80, saved.highlighter_opacity)
+
+            local other = PencilTool:new()
+            other:loadSettings(saved, colors, {})
+            local hl = other:getToolSettings(TOOLS.HIGHLIGHTER)
+            assert.equals("YELLOW", hl.color)
+            assert.equals("Yellow", hl.color_name)
+            assert.equals(80, other:getHighlighterOpacity())
+        end)
+
+        it("uses the plugin's Gray for the default so it follows the lighten setting", function()
+            tool:loadSettings({}, colors, {})
+            local hl = tool:getToolSettings(TOOLS.HIGHLIGHTER)
+            assert.equals("GRAYLIST", hl.color)
+            assert.equals("Gray", hl.color_name)
+            assert.equals(65, tool:getHighlighterOpacity())
+        end)
+
+        it("ignores an unknown color name or an opacity that is not offered", function()
+            tool:loadSettings({ highlighter_color_name = "Chartreuse", highlighter_opacity = 42 }, colors, {})
+            local hl = tool:getToolSettings(TOOLS.HIGHLIGHTER)
+            assert.equals("Gray", hl.color_name)
+            assert.equals(65, tool:getHighlighterOpacity())
+        end)
+
+        it("a saved highlighter of an older version (no keys) still loads", function()
+            tool:loadSettings({ pen_color_name = "Black" }, colors, {})
+            assert.equals(65, tool:getHighlighterOpacity())
         end)
     end)
 
@@ -299,7 +382,7 @@ describe("PencilTool", function()
 
     describe("detectEraserAndUpdate", function()
         it("activates when the eraser end touches", function()
-            assert.is_true(tool:detectEraserAndUpdate({ tool = TYPE.ERASER }))
+            assert.is_true((tool:detectEraserAndUpdate({ tool = TYPE.ERASER })))
             assert.is_true(tool.eraser_button_active)
         end)
 
@@ -311,7 +394,7 @@ describe("PencilTool", function()
 
         it("deactivates when the pen tip comes back", function()
             tool:detectEraserAndUpdate({ tool = TYPE.ERASER })
-            assert.is_false(tool:detectEraserAndUpdate({ tool = TYPE.PEN }))
+            assert.is_false((tool:detectEraserAndUpdate({ tool = TYPE.PEN })))
             assert.is_false(tool.eraser_button_active)
         end)
 
@@ -322,8 +405,107 @@ describe("PencilTool", function()
 
         it("follows the swap option", function()
             tool:swapEraserHighlighter()
-            assert.is_nil(tool:detectEraserAndUpdate({ tool = TYPE.ERASER }))
-            assert.is_true(tool:detectEraserAndUpdate({ tool = TYPE.HIGHLIGHTER }))
+            assert.is_nil((tool:detectEraserAndUpdate({ tool = TYPE.ERASER })))
+            assert.is_true((tool:detectEraserAndUpdate({ tool = TYPE.HIGHLIGHTER })))
+        end)
+    end)
+
+    describe("eraser role: click or drag", function()
+        local TOL = PencilTool.CLICK_TOLERANCE
+
+        it("a touch that stays put and lifts is a click", function()
+            assert.equals("down", tool:trackEraserContact(true, 100, 100))
+            assert.equals("hold", tool:trackEraserContact(true, 100 + TOL - 1, 100))
+            assert.equals("click", tool:trackEraserContact(false))
+        end)
+
+        it("a touch that moves beyond the tolerance is a drag, not a click", function()
+            tool:trackEraserContact(true, 100, 100)
+            assert.equals("drag_start", tool:trackEraserContact(true, 100 + TOL + 1, 100))
+            assert.equals("drag", tool:trackEraserContact(true, 200, 100))
+            assert.equals("drag_end", tool:trackEraserContact(false))
+        end)
+
+        it("moving back to the start does not turn a drag into a click", function()
+            tool:trackEraserContact(true, 100, 100)
+            tool:trackEraserContact(true, 200, 100)
+            assert.equals("drag", tool:trackEraserContact(true, 100, 100))
+            assert.equals("drag_end", tool:trackEraserContact(false))
+        end)
+
+        it("measures the tolerance as a distance, diagonals included", function()
+            tool:trackEraserContact(true, 0, 0)
+            local d = math.floor(TOL / math.sqrt(2)) -- diagonal just inside the tolerance
+            assert.equals("hold", tool:trackEraserContact(true, d, d))
+            assert.equals("drag_start", tool:trackEraserContact(true, TOL, TOL))
+        end)
+
+        it("reports nothing for a lift without a contact", function()
+            assert.is_nil(tool:trackEraserContact(false))
+        end)
+
+        it("each contact is tracked on its own", function()
+            tool:trackEraserContact(true, 0, 0)
+            tool:trackEraserContact(true, 100, 0)
+            tool:trackEraserContact(false)
+            assert.equals("down", tool:trackEraserContact(true, 0, 0))
+            assert.equals("click", tool:trackEraserContact(false))
+        end)
+
+        it("activateEraser reports whether eraser mode was just entered", function()
+            assert.is_true(tool:activateEraser(false))
+            assert.is_false(tool:activateEraser(false))
+            assert.is_true(tool.eraser_button_active)
+            assert.is_false(tool.eraser_tool_active)
+        end)
+
+        it("activateEraser keeps a contact already in progress (slot before key event)", function()
+            tool:activateEraser(false)
+            tool:trackEraserContact(true, 10, 10)
+            tool:activateEraser(false)
+            assert.equals("hold", tool:trackEraserContact(true, 12, 10))
+        end)
+
+        it("the rubber end also sets eraser_tool_active", function()
+            tool:activateEraser(true)
+            assert.is_true(tool.eraser_tool_active)
+        end)
+
+        it("deactivating mid-contact counts as a lift", function()
+            tool:activateEraser(false)
+            tool:trackEraserContact(true, 10, 10)
+            assert.is_true(tool:deactivateEraser(false))
+            assert.is_false(tool.eraser_button_active)
+
+            tool:activateEraser(false)
+            tool:trackEraserContact(true, 10, 10)
+            tool:trackEraserContact(true, 100, 10)
+            assert.is_false(tool:deactivateEraser(false))
+        end)
+
+        it("an eraser end flipped over without touching the screen is not a click", function()
+            tool:activateEraser(false)
+            assert.is_false(tool:deactivateEraser(false))
+        end)
+
+        it("a button pressed and released without touching the screen is a click", function()
+            tool:activateEraser(false)
+            assert.is_true(tool:deactivateEraser(true))
+        end)
+
+        it("a button that was used on the screen is not a second click", function()
+            tool:activateEraser(false)
+            tool:trackEraserContact(true, 10, 10)
+            assert.equals("click", tool:trackEraserContact(false))  -- toggled here
+            assert.is_false(tool:deactivateEraser(true))            -- not again on release
+        end)
+
+        it("reports a click when the slot switches back to the pen tip mid-contact", function()
+            tool:detectEraserAndUpdate({ tool = TYPE.ERASER })
+            tool:trackEraserContact(true, 10, 10)
+            local change, clicked = tool:detectEraserAndUpdate({ tool = TYPE.PEN })
+            assert.is_false(change)
+            assert.is_true(clicked)
         end)
     end)
 
@@ -362,10 +544,34 @@ describe("PencilTool", function()
             assert.equals("finish", tool:detectHighlighting({ tool = TYPE.PEN, id = -1 }))
         end)
 
-        it("keeps trying to start until the caller confirms (e.g. pen began outside a page)", function()
+        it("decides once per contact: no text below the pen means a freehand stroke", function()
             tool:experimentalTextHighlight()
             assert.equals("start", tool:detectHighlighting(down))
+            tool.highlight_freehand = true  -- caller: no text below the pen
+            -- the rest of the contact is drawn as a stroke, text is not retried
+            assert.is_nil(tool:detectHighlighting(down))
+            assert.is_nil(tool:detectHighlighting({ tool = TYPE.HIGHLIGHTER, id = 3 }))
+            -- lift ends it and the next contact decides again
+            assert.is_nil(tool:detectHighlighting(lifted))
+            assert.is_false(tool.highlight_freehand)
             assert.equals("start", tool:detectHighlighting(down))
+        end)
+
+        it("still sees the lift of a freehand contact when the tool type is gone", function()
+            tool:experimentalTextHighlight()
+            tool.highlight_freehand = true
+            assert.is_nil(tool:detectHighlighting({ tool = TYPE.PEN, id = -1 }))
+            assert.is_false(tool.highlight_freehand)
+        end)
+
+        it("the side button flag alone starts a highlight (key event before slot.tool)", function()
+            tool:experimentalTextHighlight()
+            assert.equals("start", tool:detectHighlighting({ tool = TYPE.PEN, id = 0 }, true))
+        end)
+
+        it("does not highlight while the eraser role is active", function()
+            tool:experimentalTextHighlight()
+            assert.is_nil(tool:detectHighlighting({ tool = TYPE.ERASER, id = 0 }, true))
         end)
 
         it("uses the eraser end for text highlight when swapped", function()

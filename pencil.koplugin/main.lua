@@ -146,7 +146,6 @@ local Pencil = InputContainer:extend{
 
     -- Side button state
     side_button_down = false,
-    side_button_used_for_highlight = false,  -- Track if button was used during a stroke
 
     -- Color picker state (triggered by holding pen within 5 pixels for 5 seconds)
     color_picker_start_x = nil,  -- Initial X position when pen touched down
@@ -154,6 +153,7 @@ local Pencil = InputContainer:extend{
     color_picker_start_time = nil,  -- Timestamp when pen touched down (nil if moved too far)
     color_picker_check_pending = nil,  -- Scheduled periodic check
     color_picker_showing = false,  -- Whether color picker is currently displayed
+    color_picker_tool = nil,  -- Tool (pen or highlighter) the hold-still picker is timing for
 
     -- Available colors for the pen (initialized in init() with actual Blitbuffer colors)
     available_colors = {},
@@ -374,60 +374,77 @@ function Pencil:handleStylusSlot(input, slot)
 
     -- Detect eraser end via slot.tool BEFORE key events arrive
     -- This handles the timing issue where stylus callback fires before key events
-    local eraser_change = self.tool:detectEraserAndUpdate(slot)
+    local eraser_change, eraser_clicked = self.tool:detectEraserAndUpdate(slot)
     if eraser_change == true then
         self.eraser_button_deleted = {}
     elseif eraser_change == false then
         -- Switched from eraser end to pen tip
         self:endEraserMode()
+        if eraser_clicked then self:onEraserClick() end
     end
 
-    -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
+    -- Eraser role (eraser end, or hardware button) - works even if pencil disabled.
+    --   click (touch that stays put) = toggle pen/eraser, nothing is erased
+    --   drag = erase what the pen passes over, tool is NOT toggled
     if self.tool.eraser_button_active then
-        if slot.id and slot.id >= 0 then
-            local raw_x = slot.x or self.pen_x
-            local raw_y = slot.y or self.pen_y
-            local x, y = self:transformCoordinates(raw_x, raw_y)
-            local page = self:getCurrentPage()
-            local deleted = self:eraseAtPoint(x, y, page)
-            if deleted then
-                for _, stroke in ipairs(deleted) do
-                    table.insert(self.eraser_button_deleted, stroke)
-                end
-                self.view:paintTo(Screen.bb, 0, 0)
-                self:paintTo(Screen.bb, 0, 0)
-                local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
-                if rx then
-                    Screen:refreshFast(rx, ry, rw, rh)
-                else
-                    Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
-                end
-            end
-            -- Also remove any native KOReader text highlight at this position.
-            -- removeItemByIndex emits AnnotationsModified and triggers its own
-            -- repaint, so we don't need to mirror the refreshFast call above.
-            self:eraseHighlightAtScreenPos(x, y)
-            self.pen_x = x
-            self.pen_y = y
+        local touching = slot.id and slot.id >= 0
+        local x, y
+        if touching then
+            x, y = self:transformCoordinates(slot.x or self.pen_x, slot.y or self.pen_y)
+        end
+        local phase = self.tool:trackEraserContact(touching, x, y)
+        if phase == "drag_start" then
+            -- Also erase where the pen first touched down
+            local contact = self.tool.eraser_contact
+            self:eraseWithEraserRole(contact.x0, contact.y0)
+            self:eraseWithEraserRole(x, y)
+        elseif phase == "drag" then
+            self:eraseWithEraserRole(x, y)
+        elseif phase == "click" then
+            self:onEraserClick()
         end
         return true
     end
 
-    -- Native text-highlight path: runs before any draw/stroke logic.
-    -- When input.lua has promoted slot.tool to HIGHLIGHTER (side button held),
-    -- route pen events through KOReader's ReaderHighlight instead of creating
-    -- a freehand stroke. Sticky: once we enter, we stay until pen lift even
-    -- if the side button is released mid-drag.
-    local highlight_step = self.tool:detectHighlighting(slot)
-    if highlight_step then
-        if highlight_step == "start" then
-            self:startTextHighlight(slot.x or 0, slot.y or 0)
-        elseif highlight_step == "extend" then
-            self:extendTextHighlight(slot.x or 0, slot.y or 0)
-        elseif highlight_step == "finish" then
-            self:finishTextHighlight()
+    -- Highlighter role: highlight the text below the pen, or draw a highlighter
+    -- stroke when there is no text below it (decided when the contact starts).
+    -- Text highlights go through KOReader's ReaderHighlight. Sticky: once a text
+    -- highlight starts, we stay in it until pen lift even if the side button is
+    -- released mid-drag.
+    -- A pen touching down while a picker is up taps the picker, even with the
+    -- highlighter button held (otherwise it would start a highlight under it)
+    if self.color_picker_showing and self.color_picker_widget and not self.pen_down
+            and slot.id and slot.id >= 0 then
+        local px, py = self:transformCoordinates(slot.x or 0, slot.y or 0)
+        if self.color_picker_widget:handlePenTap(px, py) then
+            return true
         end
+    end
+
+    local highlight_step = self.tool:detectHighlighting(slot, self.side_button_down)
+    if highlight_step == "extend" then
+        self:extendTextHighlight(slot.x or 0, slot.y or 0)
+        -- Holding the highlighter still over text opens the picker too
+        local hx, hy = self:transformCoordinates(slot.x or 0, slot.y or 0)
+        self.pen_x, self.pen_y = hx, hy
+        self:movePickerTracking(hx, hy)
         return true
+    elseif highlight_step == "finish" then
+        self:cancelColorPickerTimer()
+        self:finishTextHighlight()
+        return true
+    elseif highlight_step == "ignore" then
+        return true
+    elseif highlight_step == "start" then
+        if self:startTextHighlight(slot.x or 0, slot.y or 0) then
+            local hx, hy = self:transformCoordinates(slot.x or 0, slot.y or 0)
+            self.pen_x, self.pen_y = hx, hy
+            self:beginPickerTracking(hx, hy, TOOL_HIGHLIGHTER)
+            return true
+        end
+        -- No text below the pen: this contact draws a freehand highlighter
+        -- stroke (handled below, effective tool is the highlighter)
+        self.tool.highlight_freehand = true
     end
 
     if not self:isEnabled() or self:isOverlayActive() then return false end
@@ -543,19 +560,8 @@ function Pencil:handleStylusSlot(input, slot)
             local x, y = self:transformCoordinates(raw_x, raw_y)
             self.pen_x = x
             self.pen_y = y
-            -- Only track picker state and schedule the 10Hz poll when the
-            -- hold-pen-still gesture would actually produce something to
-            -- show. Skipping these when both experimental pickers are off
-            -- avoids an UIManager:scheduleIn closure allocation on every
-            -- pen-down — real GC pressure on the A53 during multi-second
-            -- strokes.
-            if self.experimental_color_picker or self.experimental_pen_width then
-                self.color_picker_start_x = x
-                self.color_picker_start_y = y
-                self.color_picker_start_time = time.now()
-                -- Schedule periodic check for color picker trigger
-                self:scheduleColorPickerCheck()
-            end
+            -- Hold still to open the pen's or the highlighter's picker
+            self:beginPickerTracking(x, y, effective_tool)
             if self.input_debug_mode then
                 self:writeDebugLog("=== PEN DOWN ===")
             end
@@ -565,15 +571,8 @@ function Pencil:handleStylusSlot(input, slot)
             local raw_y = slot.y or self.pen_y
             local x, y = self:transformCoordinates(raw_x, raw_y)
             if x ~= self.pen_x or y ~= self.pen_y then
-                -- Check if pen moved more than tolerance from start position
-                if self.color_picker_start_x and self.color_picker_start_y then
-                    local dx = math.abs(x - self.color_picker_start_x)
-                    local dy = math.abs(y - self.color_picker_start_y)
-                    if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
-                        -- Pen moved too far - reset tracking (no color picker)
-                        self:resetColorPickerTracking()
-                    end
-                end
+                -- Pen moved too far from where it came down: no picker
+                self:movePickerTracking(x, y)
                 self:addRawPoint(x, y)
                 self.pen_x = x
                 self.pen_y = y
@@ -613,12 +612,6 @@ function Pencil:startRawStroke(tool)
     local page = self:getCurrentPage()
     tool = tool or (self.side_button_down and TOOL_HIGHLIGHTER or self.tool:getTool())
     local tool_settings = self.tool:getToolSettings(tool)
-
-    -- A highlight stroke means the side button did something: releasing it
-    -- must not count as a quick press (pen/eraser toggle)
-    if self.side_button_down or tool == TOOL_HIGHLIGHTER then
-        self.side_button_used_for_highlight = true
-    end
 
     self.current_stroke = {
         page = page,
@@ -680,8 +673,12 @@ function Pencil:addRawPoint(x, y)
     local dirty_x, dirty_y, dirty_w, dirty_h
     if n == 1 then
         -- Draw first point same size as line segments for consistency
-        local half_w_draw = math.floor(width / 2)
-        Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
+        if self.current_stroke.tool == TOOL_HIGHLIGHTER then
+            self:drawLiveHighlighter(self.current_stroke, x, y, x, y)
+        else
+            local half_w_draw = math.floor(width / 2)
+            Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
+        end
         -- Use slightly larger dirty region for refresh padding
         dirty_x = x - half_w
         dirty_y = y - half_w
@@ -691,7 +688,7 @@ function Pencil:addRawPoint(x, y)
         local p1 = self.current_stroke.points[n - 1]
         local p2 = self.current_stroke.points[n]
         if self.current_stroke.tool == TOOL_HIGHLIGHTER then
-            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            self:drawLiveHighlighter(self.current_stroke, p1.x, p1.y, p2.x, p2.y)
         else
             self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
@@ -782,6 +779,7 @@ function Pencil:endRawStroke()
         end
     end
     self.current_stroke = nil
+    self.live_highlighter = nil
     -- Schedule delayed refresh for clean display after writing stops
     self:scheduleDelayedRefresh()
 end
@@ -830,36 +828,37 @@ end
 -- / saveHighlight) are the same ones KOReader itself invokes internally.
 function Pencil:startTextHighlight(raw_x, raw_y)
     if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
-        return
+        return false
     end
     local screen_x, screen_y = self:transformCoordinates(raw_x, raw_y)
     local page_pos = self.ui.view:screenToPageTransform({ x = screen_x, y = screen_y })
-    if not page_pos then return end  -- Tap outside any page area
+    if not page_pos then return false end  -- Outside any page area
+
+    -- Only a text highlight if there is a word right below the pen; otherwise
+    -- the caller draws a freehand highlighter stroke instead.
+    local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
+    if not (ok and word and word.pos0 and word.pos1) then
+        return false
+    end
 
     local rh = self.ui.highlight
     rh.hold_pos = page_pos
-
-    local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
-    if ok and word and word.pos0 and word.pos1 then
-        rh.selected_text = {
-            text = word.word or "",
-            pos0 = word.pos0,
-            pos1 = word.pos1,
-            sboxes = word.sbox and { word.sbox } or {},
-            pboxes = word.pbox and { word.pbox } or {},
-        }
-    else
-        rh.selected_text = nil
-    end
+    rh.selected_text = {
+        text = word.word or "",
+        pos0 = word.pos0,
+        pos1 = word.pos1,
+        sboxes = word.sbox and { word.sbox } or {},
+        pboxes = word.pbox and { word.pbox } or {},
+    }
 
     self.tool.highlighting = true
-    self.side_button_used_for_highlight = true
     -- Prevent the drawing-path pen-down branch from also firing on subsequent
     -- events for this contact.
     self.pen_down = true
 
     -- Show the first-word preview immediately.
     self:_paintTempSelection()
+    return true
 end
 
 -- Extend the active text-highlight selection to a new raw stylus position.
@@ -885,6 +884,20 @@ function Pencil:extendTextHighlight(raw_x, raw_y)
         -- Repaint preview with the new sboxes.
         self:_paintTempSelection()
     end
+end
+
+-- Drop the text highlight in progress without saving it (the highlighter was
+-- held still to open its picker). The pen stays "down" until it is lifted, so
+-- the rest of this contact is ignored.
+function Pencil:cancelTextHighlight()
+    local rh = self.ui and self.ui.highlight
+    self:_clearTempSelection()
+    if rh and rh.clear then
+        pcall(rh.clear, rh)
+    end
+    self.tool.highlighting = false
+    -- Rest of this contact: not a new highlight, not a stroke
+    self.tool.highlight_freehand = true
 end
 
 -- Persist the current selection as a KOReader highlight annotation and reset.
@@ -1112,6 +1125,66 @@ function Pencil:setEnabled(enabled)
     G_reader_settings:saveSetting("pencil_annotation_enabled", enabled)
 end
 
+-- Highlighter submenu: color and opacity of the highlighter strokes drawn
+-- where there is no text to highlight.
+function Pencil:buildHighlighterMenu()
+    local function hlSettings()
+        return self.tool:getToolSettings(TOOL_HIGHLIGHTER)
+    end
+
+    local color_items = {}
+    for _, color_info in ipairs(self:getHighlighterColors()) do
+        table.insert(color_items, {
+            text = color_info.name,
+            radio = true,
+            checked_func = function()
+                return hlSettings().color_name == color_info.name
+            end,
+            callback = function()
+                self:setHighlighterColor(color_info.color, color_info.name)
+            end,
+            keep_menu_open = true,
+        })
+    end
+
+    local opacity_items = {}
+    for _, percent in ipairs(PencilTool.HIGHLIGHTER_OPACITIES) do
+        table.insert(opacity_items, {
+            text = string.format("%d%%", percent),
+            radio = true,
+            checked_func = function()
+                return self.tool:getHighlighterOpacity() == percent
+            end,
+            callback = function()
+                self:setHighlighterOpacity(percent)
+            end,
+            keep_menu_open = true,
+        })
+    end
+
+    return {
+        text_func = function()
+            return T(_("Highlighter: %1, %2"), hlSettings().color_name or "?",
+                string.format("%d%%", self.tool:getHighlighterOpacity()))
+        end,
+        help_text = _("Color and opacity of the highlighter strokes drawn where there is no text under the pen. A lower opacity lets more of the page show through. Strokes already drawn keep their own color and opacity."),
+        sub_item_table = {
+            {
+                text_func = function()
+                    return T(_("Color: %1"), hlSettings().color_name or "?")
+                end,
+                sub_item_table = color_items,
+            },
+            {
+                text_func = function()
+                    return T(_("Opacity: %1"), string.format("%d%%", self.tool:getHighlighterOpacity()))
+                end,
+                sub_item_table = opacity_items,
+            },
+        },
+    }
+end
+
 function Pencil:addToMainMenu(menu_items)
     menu_items.pencil_annotation = {
         text = _("Pencil"),
@@ -1138,6 +1211,7 @@ function Pencil:addToMainMenu(menu_items)
                 end,
                 separator = true,
             },
+            self:buildHighlighterMenu(),
             {
                 text = _("Tool"),
                 help_text = _("Select pencil or eraser."),
@@ -1246,7 +1320,7 @@ function Pencil:addToMainMenu(menu_items)
                     },
                     {
                         text = _("Color picker"),
-                        help_text = _("Allow the hold-pen-still gesture to open a picker for changing pen color (and, if the pen width picker is also enabled, stroke width). When disabled, the pen stays on its last-saved color."),
+                        help_text = _("Allow the hold-pen-still gesture to open a picker for changing pen color (and, if the pen width picker is also enabled, stroke width). Holding the highlighter still opens a picker for its color and opacity. When disabled, the pen and the highlighter stay on their last-saved settings."),
                         checked_func = function()
                             return self.experimental_color_picker
                         end,
@@ -1290,7 +1364,7 @@ function Pencil:addToMainMenu(menu_items)
                     },
                     {
                         text = _("Text highlight (side button)"),
-                        help_text = _("When enabled, holding the stylus side button during a pen drag creates a native KOReader text highlight on the underlying words, like a long-press \xe2\x86\x92 Highlight. Off by default because this is a new integration and has edge cases. Requires a stylus that sends BTN_STYLUS2."),
+                        help_text = _("When enabled, holding the stylus side button during a pen drag creates a native KOReader text highlight on the words under the pen, like a long-press \xe2\x86\x92 Highlight. Where there is no text under the pen, a highlighter stroke is drawn instead. When disabled, the side button always draws a highlighter stroke. Off by default because this is a new integration and has edge cases. Requires a stylus that sends BTN_STYLUS2."),
                         checked_func = function()
                             return self.tool:isExperimentalTextHighlight()
                         end,
@@ -1299,7 +1373,7 @@ function Pencil:addToMainMenu(menu_items)
                             self:saveSettings()
                             if self.tool:isExperimentalTextHighlight() then
                                 UIManager:show(InfoMessage:new{
-                                    text = _("Text highlight enabled. Hold the side button while dragging the pen across words."),
+                                    text = _("Text highlight enabled. Hold the side button while dragging the pen across words; away from text it draws a highlighter stroke."),
                                     timeout = 3,
                                 })
                             else
@@ -1480,7 +1554,7 @@ Stylus callback: %9
 Pen slot: %10
 Pen down: %11
 
-Side button: tap to toggle pen/eraser, hold+drag to highlight.
+Eraser end: click to switch pen/eraser, drag to erase. Side button: hold+drag to highlight.
 
 Enable "Input debug mode" to log raw events for diagnosis.
 
@@ -1504,19 +1578,15 @@ Pages with strokes:%8]]),
 end
 
 -- Handle stylus button press (down event)
--- Side button behavior:
---   - Hold + drag = temporarily highlight, then return to original tool
---   - Quick press (no drawing while held) = toggle between pen and eraser
+-- Highlighter-role button (the side button, or the eraser end when swapped):
+-- while it is down the pen highlights (text below the pen, or a freehand
+-- highlighter stroke). Switching pen/eraser is the eraser role's click, see
+-- onEraserClick().
 function Pencil:onStylusButtonPress()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     self.side_button_down = true
-    -- The slot event can arrive before this key press: don't forget a
-    -- highlight (stroke or text) that is already under way.
-    self.side_button_used_for_highlight = self.tool.highlighting
-        or (self.current_stroke ~= nil and self.current_stroke.tool == TOOL_HIGHLIGHTER)
-
-    logger.dbg("Pencil: side button pressed")
+    logger.dbg("Pencil: highlighter button pressed")
     return true
 end
 
@@ -1524,20 +1594,8 @@ end
 function Pencil:onStylusButtonRelease()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    local was_down = self.side_button_down
     self.side_button_down = false
-
-    -- If the button was NOT used for highlighting (no drawing while held),
-    -- treat it as a quick press to toggle between pen and eraser
-    if was_down and not self.side_button_used_for_highlight then
-        logger.dbg("Pencil: side button quick press - toggling pen/eraser")
-        self:togglePenEraser()
-    else
-        -- Was used for highlighting - show brief feedback that we're back to normal
-        logger.dbg("Pencil: highlight complete, back to", self.tool:getTool())
-    end
-
-    self.side_button_used_for_highlight = false
+    logger.dbg("Pencil: highlighter button released, back to", self.tool:getTool())
     return true
 end
 
@@ -1545,6 +1603,40 @@ end
 function Pencil:togglePenEraser()
     self.tool:togglePenEraser()
     self:saveSettings()
+end
+
+-- Erase strokes (and native highlights) under a screen position on behalf of
+-- the eraser end/button, remembering what was deleted for undo.
+function Pencil:eraseWithEraserRole(x, y)
+    self.eraser_button_deleted = self.eraser_button_deleted or {}
+    local deleted = self:eraseAtPoint(x, y, self:getCurrentPage())
+    if deleted then
+        for _, stroke in ipairs(deleted) do
+            table.insert(self.eraser_button_deleted, stroke)
+        end
+        self.view:paintTo(Screen.bb, 0, 0)
+        self:paintTo(Screen.bb, 0, 0)
+        local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
+        if rx then
+            Screen:refreshFast(rx, ry, rw, rh)
+        else
+            Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
+        end
+    end
+    -- Also remove any native KOReader text highlight at this position.
+    -- removeItemByIndex emits AnnotationsModified and triggers its own
+    -- repaint, so we don't need to mirror the refreshFast call above.
+    self:eraseHighlightAtScreenPos(x, y)
+    self.pen_x = x
+    self.pen_y = y
+end
+
+-- A click with the eraser role (eraser end touching without dragging, or the
+-- eraser button pressed and released) switches between pen and eraser.
+function Pencil:onEraserClick()
+    if not self:isEnabled() then return end
+    logger.dbg("Pencil: eraser click - toggling pen/eraser")
+    self:togglePenEraser()
 end
 
 -- Eraser mode ended (eraser end lifted or eraser button released): push what
@@ -1579,11 +1671,9 @@ function Pencil:onKeyPress(key)
     -- works regardless of pencil enabled state
     if role == TOOL_ERASER then
         logger.info("Pencil: eraser input PRESSED:", input)
-        self.tool.eraser_button_active = true
-        self.eraser_button_deleted = {}
-        if input == PencilTool.INPUT.RUBBER then
-            -- BTN_TOOL_RUBBER: the eraser end itself, stays until it leaves
-            self.tool.eraser_tool_active = true
+        -- BTN_TOOL_RUBBER is the eraser end itself and stays flagged until it leaves
+        if self.tool:activateEraser(input == PencilTool.INPUT.RUBBER) then
+            self.eraser_button_deleted = {}
         end
         return true
     end
@@ -1596,7 +1686,7 @@ function Pencil:onKeyPress(key)
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
-        self.tool.eraser_button_active = false
+        self.tool:deactivateEraser(false)
         self.eraser_button_deleted = nil
         self.tool.eraser_tool_active = false
         return true
@@ -1605,7 +1695,7 @@ function Pencil:onKeyPress(key)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
     -- Highlighter role (side button, or the eraser end/button when swapped):
-    -- hold+drag highlights, a quick press toggles pen/eraser
+    -- hold+drag highlights
     if role == TOOL_HIGHLIGHTER then
         logger.dbg("Pencil: highlighter input press detected:", key_str)
         return self:onStylusButtonPress()
@@ -1629,14 +1719,18 @@ function Pencil:onKeyRelease(key)
         if input == PencilTool.INPUT.RUBBER then
             -- BTN_TOOL_RUBBER released (eraser end moved away)
             logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
-            self.tool.eraser_button_active = false
+            local clicked = self.tool:deactivateEraser(false)
             self.tool.eraser_tool_active = false
             self:endEraserMode()
+            if clicked then self:onEraserClick() end
             return true
         elseif self.tool.eraser_button_active then
             logger.info("Pencil: eraser input RELEASED:", input)
-            self.tool.eraser_button_active = false
+            -- The side button (when swapped to be the eraser) is a real button:
+            -- pressing and releasing it without touching the screen is a click
+            local clicked = self.tool:deactivateEraser(input == PencilTool.INPUT.SIDE_KEY)
             self:endEraserMode()
+            if clicked then self:onEraserClick() end
             return true
         end
     end
@@ -2015,19 +2109,53 @@ function Pencil:resetColorPickerTracking()
     self.color_picker_start_time = nil
 end
 
+-- Whether holding the given tool (pen or highlighter) still opens a picker.
+-- The pen has two experimental pickers (color, width); the highlighter's
+-- picker (color and opacity) follows the color picker option.
+function Pencil:isPickerEnabledFor(tool)
+    if tool == TOOL_HIGHLIGHTER then
+        return self.experimental_color_picker
+    end
+    return self.experimental_color_picker or self.experimental_pen_width
+end
+
+-- Start timing a hold-still at (x, y) with `tool`. Does nothing (and so costs
+-- nothing) when that tool has no picker to show: skipping the 10Hz poll avoids
+-- an UIManager:scheduleIn closure allocation on every pen-down, real GC
+-- pressure on the A53 during multi-second strokes.
+function Pencil:beginPickerTracking(x, y, tool)
+    if not self:isPickerEnabledFor(tool) then return end
+    self.color_picker_tool = tool
+    self.color_picker_start_x = x
+    self.color_picker_start_y = y
+    self.color_picker_start_time = time.now()
+    self:scheduleColorPickerCheck()
+end
+
+-- The pen moved: if it left the hold-still tolerance, forget the hold.
+function Pencil:movePickerTracking(x, y)
+    if self.color_picker_start_x and self.color_picker_start_y then
+        local dx = math.abs(x - self.color_picker_start_x)
+        local dy = math.abs(y - self.color_picker_start_y)
+        if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
+            self:resetColorPickerTracking()
+        end
+    end
+end
+
 -- Check if color picker should be shown (called periodically while pen is down)
 function Pencil:checkColorPickerTrigger()
-    -- Gated behind the two experimental flags. At least one must be on for
-    -- the hold-pen-still gesture to produce anything; otherwise the pen
-    -- stays on its last-saved color/width.
-    if not (self.experimental_color_picker or self.experimental_pen_width) then return end
+    -- Gated behind the experimental flags (see isPickerEnabledFor); otherwise
+    -- the pen/highlighter stays on its last-saved color/width/opacity.
+    local tool = self.color_picker_tool or TOOL_PEN
+    if not self:isPickerEnabledFor(tool) then return end
     if not self.color_picker_start_time then return end
     if self.color_picker_showing then return end
 
     local elapsed_ms = time.to_ms(time.now() - self.color_picker_start_time)
     if elapsed_ms >= COLOR_PICKER_DELAY_MS then
         -- Time elapsed without moving too far - show color picker
-        self:showColorPicker(self.pen_x, self.pen_y)
+        self:showColorPicker(self.pen_x, self.pen_y, tool)
         self:resetColorPickerTracking()
     end
 end
@@ -2071,6 +2199,12 @@ local ColorPickerWidget = InputContainer:extend {
     height = nil,
     colors = nil, -- Array of {color, name} objects
     widths = nil, -- Optional array of {name, width} objects (experimental width picker)
+    -- Highlighter picker: opacity percentages shown in the second row (instead
+    -- of widths), each previewed as `opacity_color` over white paper
+    opacities = nil,
+    opacity_color = nil,
+    opacity_color_name = nil,
+    current_opacity = nil,
     current_color_name = nil, -- Currently selected color name (for comparison)
     current_width = nil, -- Currently selected pen width (for width selection indicator)
     callback = nil,
@@ -2091,6 +2225,8 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
     local is_selected
     if item.kind == "width" then
         is_selected = (item.width_value == self.current_width)
+    elseif item.kind == "opacity" then
+        is_selected = (item.opacity_value == self.current_opacity)
     else
         is_selected = (item.name == self.current_color_name)
     end
@@ -2130,6 +2266,23 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
                 bar,
             },
         }
+    elseif item.kind == "opacity" then
+        -- The highlighter color at this opacity, as it looks on white paper
+        swatch = FrameContainer:new{
+            width = button_size,
+            height = button_size,
+            padding = 0,
+            margin = 0,
+            bordersize = border_size,
+            color = Blitbuffer.COLOR_BLACK,
+            background = item.preview,
+            WidgetContainer:new{
+                dimen = Geom:new{ w = button_size - border_size * 2, h = button_size - border_size * 2 },
+            },
+        }
+        if Screen.night_mode and self.opacity_color_name ~= "Black" and self.opacity_color_name ~= "Gray" then
+            swatch.background = swatch.background:invert()
+        end
     else
         -- Regular color swatch
         local border_color = Blitbuffer.COLOR_BLACK
@@ -2160,6 +2313,7 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
         color_value = item.color_value,  -- nil for width items
         color_name = item.name,
         width_value = item.width_value,  -- nil for color items
+        opacity_value = item.opacity_value,  -- only for opacity items
     }
 
     button.ges_events = {
@@ -2174,7 +2328,7 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
     local widget = self
     button.onTapSelectColor = function(btn)
         if widget.callback then
-            widget.callback(btn.color_value, btn.color_name, btn.width_value)
+            widget.callback(btn.color_value, btn.color_name, btn.width_value, btn.opacity_value)
         end
         if widget.close_callback then
             widget.close_callback()
@@ -2231,19 +2385,36 @@ function ColorPickerWidget:init()
         colors_row_width = #color_items * button_size + (#color_items - 1) * spacing
     end
 
-    -- Build optional width row
-    local has_widths = self.widths and #self.widths > 0
+    -- Build optional second row: widths (pen) or opacities (highlighter)
+    local has_opacities = self.opacities and #self.opacities > 0
+    local has_widths = (self.widths and #self.widths > 0) or has_opacities
     self.width_buttons_info = {}
     local width_row_group
     local widths_row_width = 0
     if has_widths then
         local width_items = {}
-        for _, width_info in ipairs(self.widths) do
-            table.insert(width_items, {
-                kind = "width",
-                name = width_info.name,
-                width_value = width_info.width,
-            })
+        if has_opacities then
+            local base = (self.opacity_color or Blitbuffer.Color8(0xCC)):getColorRGB32()
+            for _, percent in ipairs(self.opacities) do
+                local k = percent / 100
+                table.insert(width_items, {
+                    kind = "opacity",
+                    name = string.format("%d%%", percent),
+                    opacity_value = percent,
+                    preview = Blitbuffer.ColorRGB32(
+                        math.floor(255 - (255 - base.r) * k + 0.5),
+                        math.floor(255 - (255 - base.g) * k + 0.5),
+                        math.floor(255 - (255 - base.b) * k + 0.5), 0xFF),
+                })
+            end
+        else
+            for _, width_info in ipairs(self.widths) do
+                table.insert(width_items, {
+                    kind = "width",
+                    name = width_info.name,
+                    width_value = width_info.width,
+                })
+            end
         end
         width_row_group = self:_buildRow(width_items, button_size, spacing, selection_border, self.width_buttons_info)
         widths_row_width = #width_items * button_size + (#width_items - 1) * spacing
@@ -2366,7 +2537,7 @@ function ColorPickerWidget:handlePenTap(x, y)
 
     if btn then
         if self.callback then
-            self.callback(btn.color_value, btn.color_name, btn.width_value)
+            self.callback(btn.color_value, btn.color_name, btn.width_value, btn.opacity_value)
         end
         if self.close_callback then
             self.close_callback()
@@ -2447,8 +2618,15 @@ function ColorPickerWidget:onCloseWidget()
 end
 
 -- Show color picker popup near the pen position
-function Pencil:showColorPicker(x, y)
+function Pencil:showColorPicker(x, y, tool)
     if self.color_picker_showing then return end
+    local is_highlighter = (tool == TOOL_HIGHLIGHTER)
+
+    -- Holding the highlighter still over text had started a text highlight:
+    -- the user wants the picker, not a highlight
+    if is_highlighter and self.tool.highlighting then
+        self:cancelTextHighlight()
+    end
 
     -- Discard any current stroke that was made while holding still
     -- The user was holding still to trigger color picker, not intentionally drawing
@@ -2468,10 +2646,18 @@ function Pencil:showColorPicker(x, y)
     -- independently. The hold-pen-still gesture only gets here when at
     -- least one of them is on (see checkColorPickerTrigger), so at least
     -- one row is guaranteed non-empty.
-    local show_colors = self.experimental_color_picker
-    local show_widths = self.experimental_pen_width
-    local colors_for_picker = show_colors and self.available_colors or nil
-    local widths_for_picker = show_widths and self.available_widths or nil
+    local colors_for_picker, widths_for_picker, opacities_for_picker
+    if is_highlighter then
+        -- Highlighter: its colors, and its opacity in the second row
+        colors_for_picker = self:getHighlighterColors()
+        opacities_for_picker = PencilTool.HIGHLIGHTER_OPACITIES
+    else
+        colors_for_picker = self.experimental_color_picker and self.available_colors or nil
+        widths_for_picker = self.experimental_pen_width and self.available_widths or nil
+    end
+    local colors_n = colors_for_picker and #colors_for_picker or 0
+    local second_n = (opacities_for_picker and #opacities_for_picker)
+        or (widths_for_picker and #widths_for_picker) or 0
 
     -- Picker uses up to two rows (colors on top, widths below). Row width
     -- is the wider of the two visible rows; height accumulates one
@@ -2481,13 +2667,13 @@ function Pencil:showColorPicker(x, y)
     local row_gap = Screen:scaleBySize(8)
     local padding = Screen:scaleBySize(10)
     local border = Size.border.window
-    local colors_row_width = show_colors and
-        (#self.available_colors * button_size + (#self.available_colors - 1) * spacing) or 0
-    local widths_row_width = show_widths and
-        (#self.available_widths * button_size + (#self.available_widths - 1) * spacing) or 0
+    local colors_row_width = colors_n > 0 and
+        (colors_n * button_size + (colors_n - 1) * spacing) or 0
+    local widths_row_width = second_n > 0 and
+        (second_n * button_size + (second_n - 1) * spacing) or 0
     local buttons_width = math.max(colors_row_width, widths_row_width)
     local picker_width = buttons_width + padding * 2 + border * 2
-    local rows = (show_colors and 1 or 0) + (show_widths and 1 or 0)
+    local rows = (colors_n > 0 and 1 or 0) + (second_n > 0 and 1 or 0)
     local picker_height = rows * button_size + padding * 2 + border * 2
     if rows > 1 then
         picker_height = picker_height + row_gap
@@ -2517,14 +2703,36 @@ function Pencil:showColorPicker(x, y)
         picker_y = Screen:getHeight() - picker_height - screen_margin
     end
 
+    local hl_settings = self.tool:getToolSettings(TOOL_HIGHLIGHTER)
     local color_picker = ColorPickerWidget:new{
         colors = colors_for_picker,
         widths = widths_for_picker,
-        current_color_name = self.tool:getSettings().color_name,
+        opacities = opacities_for_picker,
+        opacity_color = hl_settings.color,
+        opacity_color_name = hl_settings.color_name,
+        current_opacity = self.tool:getHighlighterOpacity(),
+        current_color_name = is_highlighter and hl_settings.color_name
+            or self.tool:getSettings().color_name,
         current_width = self.tool:getSettings().width,
-        callback = function(color_value, color_name, width_value)
-            -- Width taps are routed through width_value; color taps leave it nil.
-            -- This avoids the string-match ambiguity the earlier prototype had.
+        callback = function(color_value, color_name, width_value, opacity_value)
+            -- Width and opacity taps are routed through width_value/opacity_value;
+            -- color taps leave them nil. This avoids the string-match ambiguity
+            -- the earlier prototype had.
+            if opacity_value then
+                plugin:setHighlighterOpacity(opacity_value)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Highlighter opacity: %1"), string.format("%d%%", opacity_value)),
+                    timeout = 1,
+                })
+                return
+            elseif is_highlighter then
+                plugin:setHighlighterColor(color_value, color_name)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Highlighter color: %1"), color_name),
+                    timeout = 1,
+                })
+                return
+            end
             if width_value then
                 plugin:setPenWidth(width_value)
                 UIManager:show(InfoMessage:new{
@@ -2567,6 +2775,30 @@ function Pencil:showColorPicker(x, y)
     UIManager:setDirty(self.color_picker_widget, "ui")
 
     logger.dbg("Pencil: color picker shown at", picker_x, picker_y)
+end
+
+-- Highlighter colors offered to the user: all but Black, which would hide the text.
+function Pencil:getHighlighterColors()
+    local colors = {}
+    for _, color_info in ipairs(self.available_colors) do
+        if color_info.name ~= "Black" then
+            table.insert(colors, color_info)
+        end
+    end
+    return colors
+end
+
+function Pencil:setHighlighterColor(color, color_name)
+    self.tool:setHighlighterColor(color_name, color)
+    logger.info("Pencil: setHighlighterColor - color_name =", color_name)
+    self:saveSettings()
+end
+
+function Pencil:setHighlighterOpacity(percent)
+    if self.tool:setHighlighterOpacity(percent) then
+        logger.info("Pencil: setHighlighterOpacity -", percent)
+        self:saveSettings()
+    end
 end
 
 -- Set pen color
@@ -2618,10 +2850,6 @@ function Pencil:onDrawTouch(ges)
     -- Fallback: handle via gesture system if raw input not working
     local page = self:getCurrentPage()
 
-    -- If side button is held for highlighting
-    if self.side_button_down then
-        self.side_button_used_for_highlight = true
-    end
 
     -- Start new stroke immediately with first point
     local tool_settings = self.tool:getToolSettings(effective_tool)
@@ -2647,8 +2875,12 @@ function Pencil:onDrawTouch(ges)
         and self.tool:getSettings().color_name ~= "Black" then
         color = Blitbuffer.COLOR_BLACK
     end
-    local half_w = math.floor(width / 2)
-    Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
+    if effective_tool == TOOL_HIGHLIGHTER then
+        self:drawLiveHighlighter(self.current_stroke, ges.pos.x, ges.pos.y, ges.pos.x, ges.pos.y)
+    else
+        local half_w = math.floor(width / 2)
+        Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
+    end
 
     return true
 end
@@ -2872,11 +3104,6 @@ function Pencil:onDrawPan(ges)
     local page = self:getCurrentPage()
     local effective_tool = self.tool:getEffectiveTool(is_eraser_end, is_highlighter, self.side_button_down)
 
-    -- If side button is held and we're drawing, mark it as used for highlighting
-    if self.side_button_down and effective_tool == TOOL_HIGHLIGHTER then
-        self.side_button_used_for_highlight = true
-    end
-
     -- Eraser mode: erase along path (raw input doesn't handle eraser)
     if effective_tool == TOOL_ERASER then
         if not self.eraser_deleted then
@@ -2937,14 +3164,18 @@ function Pencil:onDrawPan(ges)
         local p2 = self.current_stroke.points[n]
 
         if effective_tool == TOOL_HIGHLIGHTER then
-            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            self:drawLiveHighlighter(self.current_stroke, p1.x, p1.y, p2.x, p2.y)
         else
             self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
     elseif n == 1 then
         local p = self.current_stroke.points[1]
-        local half_w = math.floor(width / 2)
-        Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        if effective_tool == TOOL_HIGHLIGHTER then
+            self:drawLiveHighlighter(self.current_stroke, p.x, p.y, p.x, p.y)
+        else
+            local half_w = math.floor(width / 2)
+            Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        end
     end
 
     return true
@@ -3917,9 +4148,9 @@ function Pencil:renderStrokeOffset(bb, stroke, dx, dy)
         color = color:invert()
     end
 
-    local is_highlighter = (tool == TOOL_HIGHLIGHTER)
-    if is_highlighter then
-        color = stroke.color or Blitbuffer.Color8(0xDD)
+    if tool == TOOL_HIGHLIGHTER then
+        self:paintHighlighterStroke(bb, stroke, dx, dy)
+        return
     end
 
     if #stroke.points == 1 then
@@ -3930,11 +4161,7 @@ function Pencil:renderStrokeOffset(bb, stroke, dx, dy)
         for i = 2, #stroke.points do
             local p1 = stroke.points[i - 1]
             local p2 = stroke.points[i]
-            if is_highlighter then
-                self:drawHighlighterSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
-            else
-                self:drawLineSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
-            end
+            self:drawLineSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
         end
     end
 end
@@ -4409,8 +4636,11 @@ function Pencil:strokeToInkOpts(stroke)
     return {
         color = { r = rgb:getR(), g = rgb:getG(), b = rgb:getB() },
         width = width,
-        -- Highlighter renders as a translucent wash; the pen is opaque.
-        opacity = (tool == TOOL_HIGHLIGHTER) and 0.4 or 1.0,
+        -- Highlighter renders as a translucent wash at its own alpha (older
+        -- highlighter strokes, saved without a color, keep the fixed 0.4); the
+        -- pen is opaque.
+        opacity = (tool ~= TOOL_HIGHLIGHTER) and 1.0
+            or (stroke.color_name and (stroke.alpha or 0xFF) / 255 or 0.4),
     }
 end
 
@@ -4989,11 +5219,86 @@ function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
     self:drawThickLine(bb, x1, y1, x2, y2, width, color)
 end
 
--- Render a highlighter segment (semi-transparent, wider)
-function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
-    -- Highlighter is drawn as a lighter gray to simulate transparency on e-ink
-    local highlight_color = color or Blitbuffer.Color8(0xDD)
-    self:drawThickLine(bb, x1, y1, x2, y2, width, highlight_color)
+-- Highlighter strokes are translucent: they are blended into the page, never
+-- painted over it, so the text underneath stays readable. Returns
+-- blend(x, y, w, h) for the given color and alpha (0-255).
+--   * normal screen: multiply by the color mixed with white at `alpha`, the way
+--     KOReader draws its own colored highlights (text stays dark, and on white
+--     paper the result is the color at `alpha`);
+--   * inverted screen (software night mode): alpha-blend the inverted color,
+--     as KOReader does, because multiply doesn't work on a dark background;
+--   * KOReader without multiplyRectRGB: plain alpha-blend; without any blend
+--     support: paint the color mixed with white, opaque.
+function Pencil:getHighlighterBlender(bb, color, alpha)
+    alpha = alpha or 0xFF
+    local c = (color or Blitbuffer.Color8(0xDD)):getColorRGB32()
+    local r, g, b = c.r, c.g, c.b
+    local k = alpha / 255
+    local function mixWithWhite()
+        return Blitbuffer.ColorRGB32(
+            math.floor(255 - (255 - r) * k + 0.5),
+            math.floor(255 - (255 - g) * k + 0.5),
+            math.floor(255 - (255 - b) * k + 0.5), 0xFF)
+    end
+
+    if bb.getInverse and bb:getInverse() == 1 and bb.blendRectRGB32 then
+        local over = Blitbuffer.ColorRGB32(r, g, b, alpha):invert()
+        return function(x, y, w, h) bb:blendRectRGB32(x, y, w, h, over) end
+    elseif bb.multiplyRectRGB then
+        local mul = mixWithWhite()
+        return function(x, y, w, h) bb:multiplyRectRGB(x, y, w, h, mul) end
+    elseif bb.blendRectRGB32 then
+        local over = Blitbuffer.ColorRGB32(r, g, b, alpha)
+        return function(x, y, w, h) bb:blendRectRGB32(x, y, w, h, over) end
+    end
+    local opaque = mixWithWhite()
+    return function(x, y, w, h) bb:paintRectRGB32(x, y, w, h, opaque) end
+end
+
+-- Blend a whole highlighter stroke into bb (shifted by dx, dy). Every pixel is
+-- blended once, however much the brush stamps overlap. The covered rectangles
+-- are cached on the stroke (they only depend on its points and width).
+function Pencil:paintHighlighterStroke(bb, stroke, dx, dy)
+    local points = stroke.points
+    if not points or #points < 1 then return end
+    local width = stroke.width or self.tool:getToolSettings(TOOL_HIGHLIGHTER).width or 20
+    local cache = stroke.hl_cache
+    if not cache or cache.n ~= #points or cache.width ~= width then
+        cache = {
+            n = #points,
+            width = width,
+            rects = PencilGeometry.strokeCoverageRects(points, width),
+        }
+        stroke.hl_cache = cache
+    end
+    local blend = self:getHighlighterBlender(bb, stroke.color, stroke.alpha)
+    dx, dy = dx or 0, dy or 0
+    for _, r in ipairs(cache.rects) do
+        blend(r.x + dx, r.y + dy, r.w, r.h)
+    end
+end
+
+-- Draw the next piece (x1,y1 -> x2,y2; x1,y1 == x2,y2 for the first point) of the
+-- highlighter stroke being written straight into the screen buffer. Only the
+-- pixels not blended yet are blended, so overlapping stamps don't darken.
+function Pencil:drawLiveHighlighter(stroke, x1, y1, x2, y2)
+    local live = self.live_highlighter
+    if not live or live.stroke ~= stroke then
+        live = {
+            stroke = stroke,
+            cov = PencilGeometry.newCoverage(),
+            blend = self:getHighlighterBlender(Screen.bb, stroke.color, stroke.alpha),
+        }
+        self.live_highlighter = live
+    end
+    local width = stroke.width
+    local stamps = PencilGeometry.segmentStamps(x1, y1, x2, y2, width)
+    for i = 1, #stamps, 2 do
+        local rects = PencilGeometry.coverageAddRect(live.cov, stamps[i], stamps[i + 1], width, width, true)
+        for _, r in ipairs(rects) do
+            live.blend(r.x, r.y, r.w, r.h)
+        end
+    end
 end
 
 -- Check if a point is near a stroke (for eraser)
@@ -5112,11 +5417,10 @@ function Pencil:renderStroke(bb, stroke)
         color = color:invert()
     end
 
-    -- Highlighter uses lighter color
-    local is_highlighter = (tool == TOOL_HIGHLIGHTER)
-    if is_highlighter then
-        -- For highlighter, use stored color or default gray
-        color = stroke.color or Blitbuffer.Color8(0xDD)
+    -- Highlighter: translucent, blended with its own color and alpha
+    if tool == TOOL_HIGHLIGHTER then
+        self:paintHighlighterStroke(bb, stroke, 0, 0)
+        return
     end
 
     if #stroke.points == 1 then
@@ -5129,11 +5433,7 @@ function Pencil:renderStroke(bb, stroke)
         for i = 2, #stroke.points do
             local p1 = stroke.points[i - 1]
             local p2 = stroke.points[i]
-            if is_highlighter then
-                self:drawHighlighterSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
-            else
-                self:drawLineSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
-            end
+            self:drawLineSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
     end
 end
@@ -5411,6 +5711,15 @@ function Pencil:strokeFromSaved(saved)
         end
     end
 
+    -- Highlighter strokes saved before the highlighter had a choosable color have
+    -- no color name: they keep the opaque light gray they were drawn with, and
+    -- must not follow the highlighter color chosen now.
+    local alpha = saved.alpha or tool_settings.alpha
+    if tool == TOOL_HIGHLIGHTER and not saved.color_name then
+        color = Blitbuffer.Color8(0xDD)
+        alpha = 0xFF
+    end
+
     -- Points: v4 stores a packed "x y ..." string in `p`; v3 and earlier store
     -- an array of {x=,y=} tables in `points`. Reconstruct the in-memory
     -- {x=,y=} array either way.
@@ -5427,7 +5736,7 @@ function Pencil:strokeFromSaved(saved)
         width = saved.width or tool_settings.width,
         color = color,
         color_name = saved.color_name,
-        alpha = saved.alpha or tool_settings.alpha,
+        alpha = alpha,
         datetime = saved.datetime,
         points = points,
         embedded = saved.embedded,
