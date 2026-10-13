@@ -170,6 +170,7 @@ local Pencil = InputContainer:extend{
     color_picker_check_pending = nil,  -- Scheduled periodic check
     color_picker_showing = false,  -- Whether color picker is currently displayed
     color_picker_tool = nil,  -- Tool (pen or highlighter) the hold-still picker is timing for
+    color_picker_contact_active = false, -- Consume the triggering hold until pen lift
 
     -- Available colors for the pen (initialized in init() with actual Blitbuffer colors)
     available_colors = {},
@@ -578,6 +579,22 @@ function Pencil:handleStylusSlot(input, slot)
         if self.color_picker_widget:handlePenTap(px, py) then
             return true
         end
+    end
+
+    -- The hold that opened the picker must not transition back into a text or
+    -- freehand highlight behind the popup. Consume it until the pen is lifted;
+    -- the following contact can then select a picker item normally.
+    if self.color_picker_contact_active then
+        if not slot.id or slot.id < 0 then
+            self.color_picker_contact_active = false
+            self.pen_down = false
+            self.current_stroke = nil
+            self.live_highlighter = nil
+            self.tool.highlighting = false
+            self.tool.highlight_freehand = false
+            self:cancelColorPickerTimer()
+        end
+        return true
     end
 
     local highlight_step = self.tool:detectHighlighting(slot, self.side_button_down)
@@ -2603,17 +2620,21 @@ function Pencil:scheduleColorPickerCheck()
     end
 
     local plugin = self
-    -- Check every 100ms for trigger
-    self.color_picker_check_pending = UIManager:scheduleIn(0.1, function()
-        plugin.color_picker_check_pending = nil
+    local action
+    -- UIManager:scheduleIn() returns nil; unschedule() needs the callback.
+    action = function()
+        if plugin.color_picker_check_pending == action then
+            plugin.color_picker_check_pending = nil
+        end
         if plugin.pen_down and plugin.color_picker_start_time and not plugin.color_picker_showing then
             plugin:checkColorPickerTrigger()
-            -- Schedule next check if still waiting
             if plugin.color_picker_start_time then
                 plugin:scheduleColorPickerCheck()
             end
         end
-    end)
+    end
+    self.color_picker_check_pending = action
+    UIManager:scheduleIn(0.1, action)
 end
 
 -- Cancel color picker check
@@ -3020,10 +3041,17 @@ function Pencil:showColorPicker(x, y)
         self:cancelTextHighlight()
     end
 
+    -- Opening the picker is terminal for the hold gesture that triggered it.
+    self.color_picker_contact_active = true
+    self.tool.highlighting = false
+    self.tool.highlight_freehand = false
+
     -- Discard any current stroke that was made while holding still
     -- The user was holding still to trigger the menu, not intentionally drawing
     if self.current_stroke then
         self.current_stroke = nil
+        self.live_highlighter = nil
+        self.dirty_region = nil
         -- Repaint to remove the stroke from screen immediately
         self.view:paintTo(Screen.bb, 0, 0)
         self:paintTo(Screen.bb, 0, 0)
@@ -3082,6 +3110,13 @@ function Pencil:showColorPicker(x, y)
             plugin.color_picker_showing = false
             UIManager:close(plugin.color_picker_widget)
             plugin.color_picker_widget = nil
+            -- The picker may have been opened through the highlighter role.
+            -- Clear transient highlighter state without changing current_tool.
+            -- Keep color_picker_contact_active until pen lift so the swatch tap
+            -- cannot start a stroke behind the popup.
+            plugin.tool:resetHighlighterState()
+            plugin.side_button_down = false
+            plugin.live_highlighter = nil
             -- Refresh to clean up
             UIManager:setDirty(plugin.view, "ui")
         end,
