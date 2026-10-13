@@ -1,14 +1,6 @@
 # pencil.koplugin
 
-## Information
-
-This has been tested on:
-
-- Kobo Libra Colour/Kobo Stylus 2/Epub format
-
-**This will currently only work on Kobo devices! I will attempt to add other device support by request and at a later date**
-
-If you resize your book while reading it, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
+All credit for the plugin itself goes to **[mysticknits](https://github.com/mysticknits)** and the contributors listed in [Credits](#credits).
 
 ### Compatible with Koreader - Snowflake
 
@@ -27,8 +19,8 @@ If you resize your book while reading it, your annotations will be WONKY. This i
 
 ## Instructions for Installation
 
-1. Download both the `pencil.koplugin` directory and the `input.lua` file from this repository.
-2. Replace the `/frontend/device/input.lua` with the downloaded file. This enables the plugin to intercept the stylus input, separate it from touch inputs, and detect the eraser end.
+1. Download the `pencil.koplugin` directory from this repository.
+2. **Only on KOReader older than 2026.07:** also download `input.lua` and replace KOReader's `/frontend/device/input.lua` with it. This enables the plugin to intercept the stylus input, separate it from touch inputs, and detect the eraser end. KOReader 2026.07 and newer already include this stylus support, so leave their `input.lua` alone: the copy here is older and would replace a newer file.
 3. Copy the `pencil.koplugin` directory into the `/plugins` directory of KOReader.
 
 ## Configuring the Pencil Plugin
@@ -126,8 +118,19 @@ manual *Save annotations to PDF (this page)* action can still embed highlights o
 
 1. Handling changing canvas size
 
-## Acknowledgements
+## Credits
 
-Eraser end detection based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
+- **[mysticknits](https://github.com/mysticknits)**: author of pencil.koplugin. Nearly everything in this fork is their work.
+- Contributors to the original plugin:
+  - [janoschp](https://github.com/janoschp): colorful strokes
+  - [Euphoriyy](https://github.com/Euphoriyy): night mode colors
+  - [CharlieQLe](https://github.com/CharlieQLe): side button detection
+  - [AndyHazz](https://github.com/AndyHazz): stylus input with invisible overlays
+- Authors of the upstream pull requests merged into this fork:
+  - [andrew-lawlor](https://github.com/andrew-lawlor): bookmarks at invalid positions ([#89](https://github.com/mysticknits/pencil.koplugin/pull/89))
+  - [bateast](https://github.com/bateast): strokes follow a renamed file ([#86](https://github.com/mysticknits/pencil.koplugin/pull/86))
+  - laurenamy: v4 save format (from [#77](https://github.com/mysticknits/pencil.koplugin/pull/77))
+- Eraser end detection is based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
+- Fork changes written with [Claude Code](https://claude.com/claude-code).
 
-xoxo
+Licensed under the same license as the original plugin (see [LICENSE](LICENSE)).
