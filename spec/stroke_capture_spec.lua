@@ -45,7 +45,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -54,29 +54,25 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local function new_pencil()
     local p = setmetatable({
-        current_tool = "pen",
-        tool_settings = { pen = { color = { getColor8 = function() return { a = 0 } end }, color_name = "Black", width = 3, alpha = 1 } },
-        strokes = {},
-        undo_stack = {},
+        tool = make_tool(PencilTool, { tool_settings = { pen = { color = { getColor8 = function() return { a = 0 } end }, color_name = "Black", width = 3, alpha = 1 } } }),
         refresh_interval_ms = 16,
         input_debug_mode = false,
-        eraser_button_active = false,
-        swap_eraser_and_highlighter = false,
-        experimental_text_highlight = false,
         experimental_color_picker = false,
         experimental_pen_width = false,
         side_button_down = false,
-        highlighting = false,
         pen_down = false,
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
     p.getCurrentPage = function() return 1 end
-    p.indexStroke = function() end
     p.assignStrokeToGroup = function() end
     p.scheduleDeferredWork = function() end
     p.scheduleDelayedRefresh = function() end
@@ -100,8 +96,8 @@ describe("stroke capture (real main.lua)", function()
         local p = new_pencil()
         down(p, 100, 200)
         lift(p)
-        assert.are.equal(1, #p.strokes)
-        assert.are.same({ { x = 100, y = 200 } }, p.strokes[1].points)
+        assert.are.equal(1, #p.store.strokes)
+        assert.are.same({ { x = 100, y = 200 } }, p.store.strokes[1].points)
     end)
 
     it("keeps every dot of an ellipsis written quickly", function()
@@ -110,7 +106,7 @@ describe("stroke capture (real main.lua)", function()
             down(p, 100 + i * 20, 300)
             lift(p)
         end
-        assert.are.equal(3, #p.strokes)
+        assert.are.equal(3, #p.store.strokes)
     end)
 
     it("starts a stroke at the touch-down point", function()
@@ -119,8 +115,8 @@ describe("stroke capture (real main.lua)", function()
         move(p, 20, 10)
         move(p, 30, 10)
         lift(p)
-        assert.are.same({ x = 10, y = 10 }, p.strokes[1].points[1])
-        assert.are.equal(3, #p.strokes[1].points)
+        assert.are.same({ x = 10, y = 10 }, p.store.strokes[1].points[1])
+        assert.are.equal(3, #p.store.strokes[1].points)
     end)
 
     it("does not add a point when the touch-down frame has no position", function()
@@ -128,7 +124,7 @@ describe("stroke capture (real main.lua)", function()
         p:handleStylusSlot(nil, { id = 1, tool = 1 })
         move(p, 50, 60)
         lift(p)
-        assert.are.same({ { x = 50, y = 60 } }, p.strokes[1].points)
+        assert.are.same({ { x = 50, y = 60 } }, p.store.strokes[1].points)
     end)
 
     it("refreshes the stroke tail on lift instead of waiting for the delayed refresh", function()

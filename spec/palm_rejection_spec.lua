@@ -35,7 +35,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -44,6 +44,8 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilTool = require("lib/penciltool")
+local PencilStrokes = require("lib/pencilstrokes")
 
 local PEN_SLOT = 4
 
@@ -52,6 +54,7 @@ local function new_pencil(opts)
     local p = setmetatable({
         palm_rejection = opts.palm_rejection ~= false,
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.isEnabled = function() return true end
     return p
 end

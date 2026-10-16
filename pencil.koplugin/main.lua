@@ -20,6 +20,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local PencilGeometry = require("lib/geometry")
 local PencilTool = require("lib/penciltool")
+local PencilStrokes = require("lib/pencilstrokes")
 local Screen = Device.screen
 local Size = require("ui/size")
 local Font = require("ui/font")
@@ -108,7 +109,6 @@ local IMAGE_CAPTURE_DEBOUNCE_S = 4       -- seconds after last stroke before cap
 local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotation is stale
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
-local STROKES_PATH_SETTING = "pencil_strokes_path"
 local ANNOTATION_HOLD_HIT_PAD = 18  -- extra pixels around annotation bbox
 
 -- Module-level reference to the most recently initialized Pencil instance.
@@ -124,10 +124,9 @@ local Pencil = InputContainer:extend{
     name = "pencil_annotation",
     is_doc_only = true,  -- Only available when a document is open
     current_stroke = nil,
-    strokes = nil,       -- All strokes for current document
+    store = nil,         -- PencilStrokes instance (strokes of the document, page index, history), set in init()
     tool = nil,          -- PencilTool instance (tool selection/settings/eraser/highlight state), set in init()
     touch_zones_registered = false,
-    undo_stack = {},     -- For undo functionality
     eraser_button_deleted = {},    -- Track deletions for undo
 
     -- Stylus callback for lowest latency (via Input:registerStylusCallback)
@@ -176,6 +175,29 @@ local Pencil = InputContainer:extend{
     available_colors = {},
 }
 
+-- The document's strokes, their page index and undo/redo history, and what
+-- PencilStrokes needs to know about this plugin and the current view.
+function Pencil:initStrokeStore()
+    self.store = PencilStrokes:new{
+        log = function(message)
+            if self.input_debug_mode then self:writeDebugLog(message) end
+        end,
+        -- Annotation groups keep indices into the stroke list: renumber them
+        on_removed = function(indices) self:shiftGroupStrokeIndices(indices) end,
+    }
+    self.stroke_render_ctx = {
+        tool_settings = function(tool) return self.tool:getToolSettings(tool) end,
+        night_mode = false,
+    }
+    self.stroke_view = {
+        zoom = function(page) return (self:pageAffine(page)) end,
+        sync = function(stroke) return self:syncStrokeToView(stroke) end,
+    }
+    self.stroke_translate = function(strokes, dx, dy, pdeltas, sign)
+        return self:translateStrokes(strokes, dx, dy, pdeltas, sign)
+    end
+end
+
 function Pencil:init()
     -- CRITICAL: Add plugin to ReaderUI widget tree so it receives ALL key events
     -- This ensures we catch Eraser button press/release events
@@ -184,14 +206,10 @@ function Pencil:init()
     table.insert(self.ui.active_widgets, self) -- Always receive events even when hidden
 
     self.ui.menu:registerToMainMenu(self)
-    self.strokes = {}
-    self.page_strokes = {}  -- Index: page -> array of stroke indices
+    self:initStrokeStore()
     self.annotation_groups = {}  -- Annotation groups for bookmark integration
-    self.strokes_loaded = false  -- Set true after successful loadStrokes
-    self.undo_stack = {}
     self.pending_group_strokes = {}
     self.pending_color_strokes = {}
-    self.redo_stack = {}
 
     -- Tool selection, per-tool settings, eraser and highlight mode state
     self.tool = PencilTool:new()
@@ -295,18 +313,7 @@ function Pencil:init()
     -- pencil bookmarks open the saved image.
     self:installBookmarkHook()
 
-    logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.tool:getTool(), "strokes =", #self.strokes)
-end
-
-function Pencil:getLiveStrokeColor(stroke)
-    if self.live_black_preview
-        and stroke.tool == TOOL_PEN
-        and stroke.color_name
-        and stroke.color_name ~= "Black" then
-        return Blitbuffer.COLOR_BLACK
-    end
-
-    return stroke.color
+    logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.tool:getTool(), "strokes =", self.store:count())
 end
 
 -- Dispatcher event handlers (for custom gesture mapping)
@@ -495,7 +502,6 @@ function Pencil:transformCoordinates(x, y)
     local rotation = Screen:getRotationMode()
     return PencilGeometry.transformForRotation(x, y, rotation, Screen:getWidth(), Screen:getHeight())
 end
-
 
 -- Handle a stylus slot from the callback
 -- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
@@ -687,7 +693,7 @@ function Pencil:handleStylusSlot(input, slot)
                 self.pen_down = false
                 self.tool.erasing = false
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
-                    self:pushUndo({ type = "delete", strokes = self.eraser_deleted })
+                    self.store:pushUndo({ type = "delete", strokes = self.eraser_deleted })
                     self:saveStrokes()
                 end
                 self.eraser_deleted = nil
@@ -809,17 +815,7 @@ function Pencil:startRawStroke(tool)
     tool = tool or (self.side_button_down and TOOL_HIGHLIGHTER or self.tool:getTool())
     local tool_settings = self.tool:getToolSettings(tool)
 
-    self.current_stroke = {
-        page = page,
-        tool = tool,
-        points = {},
-        width = tool_settings.width,
-        color = tool_settings.color,
-        color_name = tool_settings.color_name,
-        alpha = tool_settings.alpha,
-        datetime = os.time(),
-        bbox = nil, -- incrementally maintained; avoids O(points) work at PEN UP
-    }
+    self.current_stroke = PencilStrokes.newStroke(page, tool, tool_settings)
 
     -- Resolve the effective draw color once per stroke. The night-mode
     -- invert allocates a new FFI color object, so doing it per point puts
@@ -870,7 +866,7 @@ function Pencil:addRawPoint(x, y)
     local n = #self.current_stroke.points
 
     local width = self.current_stroke.width
-    local color = self:getLiveStrokeColor(self.current_stroke)
+    local color = PencilStrokes.liveColor(self.current_stroke, self.live_black_preview)
     local half_w = math.floor(width / 2) + 2
 
     -- Reinvert color in night mode (if it's not black or gray)
@@ -898,7 +894,7 @@ function Pencil:addRawPoint(x, y)
         end
         -- Draw first point same size as line segments for consistency
         if self.current_stroke.tool == TOOL_HIGHLIGHTER then
-            self:drawLiveHighlighter(self.current_stroke, x, y, x, y)
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, x, y, x, y)
         else
             local half_w_draw = math.floor(width / 2)
             Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
@@ -912,9 +908,9 @@ function Pencil:addRawPoint(x, y)
         local p1 = self.current_stroke.points[n - 1]
         local p2 = self.current_stroke.points[n]
         if self.current_stroke.tool == TOOL_HIGHLIGHTER then
-            self:drawLiveHighlighter(self.current_stroke, p1.x, p1.y, p2.x, p2.y)
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, p1.x, p1.y, p2.x, p2.y)
         else
-            self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            PencilStrokes.drawThickLine(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
         -- Calculate bounding box of the segment
         dirty_x = math.min(p1.x, p2.x) - half_w
@@ -1065,14 +1061,13 @@ function Pencil:endRawStroke()
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
         self:anchorStrokeToPage(self.current_stroke)
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
-        self:assignStrokeToGroup(#self.strokes)
+        local stroke_idx = self.store:add(self.current_stroke)
+        self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
+        self:assignStrokeToGroup(stroke_idx)
         self:scheduleDeferredWork()
         if self.input_debug_mode then
             self:writeDebugLog(string.format("endRawStroke: SAVED stroke #%d with %d points, total strokes=%d",
-                #self.strokes, #self.current_stroke.points, #self.strokes))
+                self.store:count(), #self.current_stroke.points, self.store:count()))
         end
         logger.dbg("Pencil: raw stroke ended with", #self.current_stroke.points, "points")
         -- Track the region this stroke touched so the delayed refresh below
@@ -1574,7 +1569,7 @@ function Pencil:addToMainMenu(menu_items)
                     self:undoLastStroke()
                 end,
                 enabled_func = function()
-                    return #self.undo_stack > 0
+                    return self.store:canUndo()
                 end,
             },
             {
@@ -1583,7 +1578,7 @@ function Pencil:addToMainMenu(menu_items)
                     self:redoLastStroke()
                 end,
                 enabled_func = function()
-                    return self.redo_stack ~= nil and #self.redo_stack > 0
+                    return self.store:canRedo()
                 end,
                 separator = true,
             },
@@ -1593,7 +1588,7 @@ function Pencil:addToMainMenu(menu_items)
                     self:clearPageStrokes()
                 end,
                 enabled_func = function()
-                    return self:hasStrokesOnCurrentPage()
+                    return self.store:hasOnPage(self:getCurrentPage())
                 end,
             },
             {
@@ -1602,7 +1597,7 @@ function Pencil:addToMainMenu(menu_items)
                     self:clearAllStrokes()
                 end,
                 enabled_func = function()
-                    return #self.strokes > 0
+                    return self.store:count() > 0
                 end,
             },
             {
@@ -1897,12 +1892,12 @@ end
 -- Show current annotation status for debugging
 function Pencil:showAnnotationStatus()
     local page = self:getCurrentPage()
-    local page_strokes = self.page_strokes[page] and #self.page_strokes[page] or 0
+    local page_strokes = self.store.page_strokes[page] and #self.store.page_strokes[page] or 0
     local filepath = self:getStrokesFilePath() or "not available"
 
     -- Show all pages with strokes for debugging
     local pages_info = ""
-    for p, indices in pairs(self.page_strokes) do
+    for p, indices in pairs(self.store.page_strokes) do
         pages_info = pages_info .. string.format("\n  %s (%s): %d", tostring(p), type(p), #indices)
     end
     if pages_info == "" then
@@ -1934,7 +1929,7 @@ Enable "Input debug mode" to log raw events for diagnosis.
 
 Pages with strokes:%8]]),
         self.tool:getTool(),
-        #self.strokes,
+        self.store:count(),
         page_strokes,
         tostring(page),
         type(page),
@@ -2017,7 +2012,7 @@ end
 -- it deleted onto the undo stack and repaint.
 function Pencil:endEraserMode()
     if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-        table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+        self.store:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
         self:saveStrokes()
     end
     self.eraser_button_deleted = nil
@@ -2057,7 +2052,7 @@ function Pencil:onKeyPress(key)
         logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
         if self.tool.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
-            self:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
+            self.store:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
         self.tool:deactivateEraser(false)
@@ -2125,94 +2120,24 @@ function Pencil:onKeyRelease(key)
     return false
 end
 
--- Undo last stroke
--- Record an undoable action. "add" actions keep a reference to the stroke
--- so undo/redo still find it after other strokes were erased (indices shift).
--- Any new action invalidates the redo history.
-function Pencil:pushUndo(action)
-    if action.type == "add" and not action.stroke and action.stroke_idx then
-        action.stroke = self.strokes[action.stroke_idx]
-    end
-    table.insert(self.undo_stack, action)
-    self.redo_stack = {}
-end
-
--- Index of a stroke in self.strokes, trying the remembered index first.
-function Pencil:findStrokeIndex(stroke, hint)
-    if hint and self.strokes[hint] == stroke then return hint end
-    for i, s in ipairs(self.strokes) do
-        if s == stroke then return i end
-    end
-end
-
--- Remove strokes by reference, keeping group stroke indices valid. Returns
--- true if any was removed.
-function Pencil:removeStrokes(strokes)
-    local indices = {}
-    for _, stroke in ipairs(strokes) do
-        local idx = self:findStrokeIndex(stroke)
-        if idx then table.insert(indices, idx) end
-    end
-    table.sort(indices, function(a, b) return a > b end)
-    for _, idx in ipairs(indices) do
-        table.remove(self.strokes, idx)
-    end
-    if #indices > 0 then
-        self:shiftGroupStrokeIndices(indices)
-    end
-    return #indices > 0
-end
-
 function Pencil:afterHistoryChange()
-    self:rebuildPageIndex()
+    self.store:rebuildPageIndex()
     -- Group rebuild and save are slow; run them once the pen rests.
     self.groups_stale = true
     self:scheduleDeferredWork()
     self:repaintReader()
 end
 
--- Undo (undoing = true) or redo an action. Returns the action to push on
--- the opposite stack, or nil if nothing could be applied.
-function Pencil:applyHistoryAction(action, undoing)
-    if action.type == "add" then
-        local stroke = action.stroke or (action.stroke_idx and self.strokes[action.stroke_idx])
-        if not stroke then return nil end
-        if undoing then
-            if not self:removeStrokes({ stroke }) then return nil end
-        else
-            table.insert(self.strokes, stroke)
-        end
-        return { type = "add", stroke = stroke }
-    elseif action.type == "delete" then
-        if undoing then
-            for _, stroke in ipairs(action.strokes) do
-                table.insert(self.strokes, stroke)
-            end
-        elseif not self:removeStrokes(action.strokes) then
-            return nil
-        end
-        return { type = "delete", strokes = action.strokes }
-    elseif action.type == "move" then
-        self:translateStrokes(action.strokes, action.dx, action.dy, action.pdeltas, undoing and -1 or 1)
-        return action
+function Pencil:undoLastStroke()
+    if self.store:undo(self.stroke_translate) then
+        self:afterHistoryChange()
     end
 end
 
-function Pencil:undoLastStroke()
-    local action = table.remove(self.undo_stack)
-    if not action then return end
-    local redo = self:applyHistoryAction(action, true)
-    self.redo_stack = self.redo_stack or {}
-    if redo then table.insert(self.redo_stack, redo) end
-    self:afterHistoryChange()
-end
-
 function Pencil:redoLastStroke()
-    local action = self.redo_stack and table.remove(self.redo_stack)
-    if not action then return end
-    local undo = self:applyHistoryAction(action, false)
-    if undo then table.insert(self.undo_stack, undo) end
-    self:afterHistoryChange()
+    if self.store:redo(self.stroke_translate) then
+        self:afterHistoryChange()
+    end
 end
 
 function Pencil:setupPenInput()
@@ -2476,7 +2401,7 @@ function Pencil:flushPendingGroups()
     if not pending or #pending == 0 then return end
     self.pending_group_strokes = {}
     for _, stroke_idx in ipairs(pending) do
-        if self.strokes[stroke_idx] then
+        if self.store.strokes[stroke_idx] then
             self:assignStrokeToGroup(stroke_idx)
         end
     end
@@ -2712,7 +2637,7 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border, butt
         -- Truthful preview: a horizontal black bar whose height equals the
         -- stroke's actual device-pixel thickness. We deliberately do NOT
         -- scale by Screen:scaleBySize — the stroke itself is drawn in raw
-        -- pixels (see paintRectRGB32 in drawLineSegment), so scaling here
+        -- pixels (see paintRectRGB32 in PencilStrokes.drawThickLine), so scaling here
         -- would lie about the line weight.
         local inner = button_size - border_size * 2
         local bar_h = item.width_value
@@ -3240,7 +3165,7 @@ end
 
 -- Draw a piece of the lasso path as a thin gray line, refreshed in batches.
 function Pencil:drawLassoSegment(x1, y1, x2, y2)
-    self:drawLineSegment(Screen.bb, x1, y1, x2, y2, 2, Blitbuffer.COLOR_DARK_GRAY)
+    PencilStrokes.drawThickLine(Screen.bb, x1, y1, x2, y2, 2, Blitbuffer.COLOR_DARK_GRAY)
     local x0, y0 = math.min(x1, x2) - 3, math.min(y1, y2) - 3
     local w, h = math.abs(x2 - x1) + 6, math.abs(y2 - y1) + 6
     local r = self.dirty_region
@@ -3263,8 +3188,8 @@ function Pencil:visibleStrokes()
     local out = {}
     local pages, page = self:getVisiblePages()
     for _, p in ipairs(pages) do
-        for _, idx in ipairs(self.page_strokes[p] or {}) do
-            local stroke = self.strokes[idx]
+        for _, idx in ipairs(self.store.page_strokes[p] or {}) do
+            local stroke = self.store.strokes[idx]
             if stroke then
                 if stroke.page_points then
                     if self:syncStrokeToView(stroke) then table.insert(out, stroke) end
@@ -3402,8 +3327,8 @@ end
 function Pencil:deleteLassoSelection()
     local selected = self.lasso.strokes
     self:clearLasso()
-    if self:removeStrokes(selected) then
-        self:pushUndo({ type = "delete", strokes = selected })
+    if self.store:removeStrokes(selected) then
+        self.store:pushUndo({ type = "delete", strokes = selected })
     end
     self:afterHistoryChange()
 end
@@ -3425,7 +3350,7 @@ function Pencil:applyLassoMove()
     end
     self:clearLasso()
     local pdeltas = self:translateStrokes(lasso.strokes, dx, dy)
-    self:pushUndo({ type = "move", strokes = lasso.strokes, dx = dx, dy = dy, pdeltas = pdeltas })
+    self.store:pushUndo({ type = "move", strokes = lasso.strokes, dx = dx, dy = dy, pdeltas = pdeltas })
     self:afterHistoryChange()
 end
 
@@ -3433,32 +3358,7 @@ end
 -- Page-anchored strokes move in page space by pdeltas[i] (computed from the
 -- view zoom on the first move and reused for undo/redo). Returns pdeltas.
 function Pencil:translateStrokes(strokes, dx, dy, pdeltas, sign)
-    sign = sign or 1
-    pdeltas = pdeltas or {}
-    for i, stroke in ipairs(strokes) do
-        local shifted = false
-        if stroke.page_points then
-            local d = pdeltas[i]
-            if not d then
-                local zoom = stroke._vz or self:pageAffine(stroke.page)
-                d = { x = zoom and dx / zoom or 0, y = zoom and dy / zoom or 0 }
-                pdeltas[i] = d
-            end
-            for _, q in ipairs(stroke.page_points) do
-                q.x = q.x + sign * d.x
-                q.y = q.y + sign * d.y
-            end
-            stroke._vz = nil
-            shifted = self:syncStrokeToView(stroke)
-        end
-        if not shifted then
-            for _, pt in ipairs(stroke.points) do
-                pt.x = pt.x + sign * dx
-                pt.y = pt.y + sign * dy
-            end
-        end
-    end
-    return pdeltas
+    return PencilStrokes.translate(strokes, dx, dy, pdeltas, sign, self.stroke_view)
 end
 
 -- Notes: a full-screen canvas for longer handwriting, anchored to a spot in
@@ -3737,7 +3637,7 @@ function NoteCanvas:renderStroke(bb, stroke)
         return
     end
     for i = 2, #pts do
-        self.plugin:drawLineSegment(bb, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, stroke.width, color)
+        PencilStrokes.drawThickLine(bb, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, stroke.width, color)
     end
 end
 
@@ -3838,7 +3738,7 @@ end
 function NoteCanvas:drawLive(x1, y1, x2, y2)
     local plugin = self.plugin
     local width = self.stroke.width
-    plugin:drawLineSegment(Screen.bb, x1, y1, x2, y2, width, self:strokeColor(self.stroke))
+    PencilStrokes.drawThickLine(Screen.bb, x1, y1, x2, y2, width, self:strokeColor(self.stroke))
     local pad = math.floor(width / 2) + 2
     local x0, y0 = math.min(x1, x2) - pad, math.min(y1, y2) - pad
     local w, h = math.abs(x2 - x1) + 2 * pad, math.abs(y2 - y1) + 2 * pad
@@ -3930,7 +3830,6 @@ function Pencil:onDrawTouch(ges)
     -- Fallback: handle via gesture system if raw input not working
     local page = self:getCurrentPage()
 
-
     -- Start new stroke immediately with first point
     local tool_settings = self.tool:getToolSettings(effective_tool)
     self.current_stroke = {
@@ -3956,7 +3855,7 @@ function Pencil:onDrawTouch(ges)
         color = Blitbuffer.COLOR_BLACK
     end
     if effective_tool == TOOL_HIGHLIGHTER then
-        self:drawLiveHighlighter(self.current_stroke, ges.pos.x, ges.pos.y, ges.pos.x, ges.pos.y)
+        self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, ges.pos.x, ges.pos.y, ges.pos.x, ges.pos.y)
     else
         local half_w = math.floor(width / 2)
         Screen.bb:paintRectRGB32(ges.pos.x - half_w, ges.pos.y - half_w, width, width, color)
@@ -4127,7 +4026,7 @@ function Pencil:onDrawTap(ges)
         local erased = self:eraseAtPoint(ges.pos.x, ges.pos.y, page)
         if erased then
             logger.info("Pencil: erased", #erased, "strokes")
-            self:pushUndo({ type = "delete", strokes = erased })
+            self.store:pushUndo({ type = "delete", strokes = erased })
             self:saveStrokes()
             UIManager:setDirty(self.view, "ui")
         else
@@ -4138,24 +4037,15 @@ function Pencil:onDrawTap(ges)
 
     -- Pen or Highlighter: create a dot
     local tool_settings = self.tool:getToolSettings(effective_tool)
-    local stroke = {
-        page = page,
-        tool = effective_tool,
-        points = { { x = ges.pos.x, y = ges.pos.y } },
-        width = tool_settings.width,
-        color = tool_settings.color,
-        color_name = tool_settings.color_name,
-        alpha = tool_settings.alpha,
-        datetime = os.time(),
-    }
+    local stroke = PencilStrokes.newStroke(page, effective_tool, tool_settings,
+        { { x = ges.pos.x, y = ges.pos.y } })
 
     self:anchorStrokeToPage(stroke)
-    table.insert(self.strokes, stroke)
-    self:indexStroke(#self.strokes, stroke.page)
+    local stroke_idx = self.store:add(stroke)
     self:saveStrokes()
 
     -- Add to undo stack
-    self:pushUndo({ type = "add", stroke_idx = #self.strokes })
+    self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
 
     -- Draw directly to screen buffer
     self:renderStroke(Screen.bb, stroke)
@@ -4246,14 +4136,14 @@ function Pencil:onDrawPan(ges)
         local p2 = self.current_stroke.points[n]
 
         if effective_tool == TOOL_HIGHLIGHTER then
-            self:drawLiveHighlighter(self.current_stroke, p1.x, p1.y, p2.x, p2.y)
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, p1.x, p1.y, p2.x, p2.y)
         else
-            self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            PencilStrokes.drawThickLine(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
     elseif n == 1 then
         local p = self.current_stroke.points[1]
         if effective_tool == TOOL_HIGHLIGHTER then
-            self:drawLiveHighlighter(self.current_stroke, p.x, p.y, p.x, p.y)
+            self.live_highlighter = PencilStrokes.drawLiveHighlighter(self.live_highlighter, Screen.bb, self.current_stroke, p.x, p.y, p.x, p.y)
         else
             local half_w = math.floor(width / 2)
             Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
@@ -4285,7 +4175,7 @@ function Pencil:onDrawPanRelease(ges)
     if effective_tool == TOOL_ERASER then
         if self.eraser_deleted and #self.eraser_deleted > 0 then
             -- Add deleted strokes to undo stack
-            self:pushUndo({ type = "delete", strokes = self.eraser_deleted })
+            self.store:pushUndo({ type = "delete", strokes = self.eraser_deleted })
             self:saveStrokes()
         end
         -- Always refresh screen after erasing to clear any visual artifacts
@@ -4306,13 +4196,12 @@ function Pencil:onDrawPanRelease(ges)
     if #self.current_stroke.points >= 1 then
         -- Finalize the stroke
         self:anchorStrokeToPage(self.current_stroke)
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        local stroke_idx = self.store:add(self.current_stroke)
         self:saveStrokes()
 
         -- Add to undo stack
-        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
-        self:assignStrokeToGroup(#self.strokes)
+        self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
+        self:assignStrokeToGroup(stroke_idx)
 
         logger.dbg("Pencil: stroke completed with", #self.current_stroke.points, "points")
         self:accumulateRefreshBbox(self.current_stroke)
@@ -4372,46 +4261,15 @@ function Pencil:anchorStrokeToPage(stroke)
     if not stroke._anchor_zoom and stroke.points and stroke.points[1] then
         self:captureStrokeAnchor(stroke, stroke.points[1].x, stroke.points[1].y)
     end
-    local zoom = stroke._anchor_zoom
-    if not zoom then return end
-    local ox, oy = stroke._anchor_ox, stroke._anchor_oy
-    local page_points = {}
-    for i, pt in ipairs(stroke.points) do
-        page_points[i] = { x = (pt.x - ox) / zoom, y = (pt.y - oy) / zoom }
-    end
-    stroke.page_points = page_points
-    stroke.page = stroke._anchor_page
-    -- The screen points already match this view.
-    stroke._vz, stroke._vox, stroke._voy = zoom, ox, oy
-    stroke._anchor_page, stroke._anchor_zoom = nil, nil
-    stroke._anchor_ox, stroke._anchor_oy = nil, nil
+    PencilStrokes.anchorToPage(stroke)
 end
 
 -- Bring a page-anchored stroke's screen points (stroke.points) in line with
 -- the current view. Cheap when the view hasn't changed.
 -- @return false if the stroke's page isn't visible
 function Pencil:syncStrokeToView(stroke)
-    local pp = stroke.page_points
-    if not pp then return true end
-    local zoom, ox, oy = self:pageAffine(stroke.page)
-    if not zoom then return false end
-    if stroke._vz == zoom and stroke._vox == ox and stroke._voy == oy then
-        return true
-    end
-    local points = stroke.points or {}
-    for i, q in ipairs(pp) do
-        local pt = points[i]
-        if not pt then
-            pt = {}
-            points[i] = pt
-        end
-        pt.x = q.x * zoom + ox
-        pt.y = q.y * zoom + oy
-    end
-    for i = #points, #pp + 1, -1 do points[i] = nil end
-    stroke.points = points
-    stroke._vz, stroke._vox, stroke._voy = zoom, ox, oy
-    return true
+    if not stroke.page_points then return true end
+    return PencilStrokes.syncToView(stroke, self:pageAffine(stroke.page))
 end
 
 -- Pages whose strokes should be drawn / erased: every visible page in PDF
@@ -4437,14 +4295,6 @@ function Pencil:getCurrentPage()
         -- Fallback to XPointer if conversion not available
         return xp
     end
-end
-
--- Index a stroke by page for quick lookup
-function Pencil:indexStroke(stroke_idx, page)
-    if not self.page_strokes[page] then
-        self.page_strokes[page] = {}
-    end
-    table.insert(self.page_strokes[page], stroke_idx)
 end
 
 -- Get an XPointer for a screen-space position on the current rolling-mode
@@ -4532,11 +4382,11 @@ function Pencil:backfillGroupXPointers()
 end
 
 -- Assign a newly-added stroke to an annotation group (or create a new one).
--- Called after a stroke is finalized and inserted into self.strokes.
--- @param stroke_idx number  index of the stroke in self.strokes
+-- Called after a stroke is finalized and inserted into self.store.strokes.
+-- @param stroke_idx number  index of the stroke in self.store.strokes
 -- @param skip_bookmark boolean  if true, skip bookmark sync (used during bootstrap)
 function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
-    local stroke = self.strokes[stroke_idx]
+    local stroke = self.store.strokes[stroke_idx]
     if not stroke then return end
 
     local bbox = stroke.bbox or PencilGeometry.computeStrokeBbox(stroke)
@@ -4566,7 +4416,7 @@ function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
         -- Update tool to majority
         local pen_count, hl_count = 0, 0
         for _, si in ipairs(best_group.stroke_indices) do
-            local s = self.strokes[si]
+            local s = self.store.strokes[si]
             if s then
                 if s.tool == TOOL_HIGHLIGHTER then hl_count = hl_count + 1
                 else pen_count = pen_count + 1 end
@@ -4638,7 +4488,7 @@ function Pencil:rebuildAnnotationGroups()
 
         -- Build list of {index, datetime} sorted by datetime
         local sorted = {}
-        for i, stroke in ipairs(self.strokes) do
+        for i, stroke in ipairs(self.store.strokes) do
             table.insert(sorted, { idx = i, dt = stroke.datetime or 0 })
         end
         table.sort(sorted, function(a, b) return a.dt < b.dt end)
@@ -4848,7 +4698,7 @@ end
 
 function Pencil:getMyScriptStrokesForGroup(group)
     if not group or type(group.stroke_indices) ~= "table" then return nil, { message = "Invalid annotation group" } end
-    return MyScript.strokes_from_pencil({ strokes = self.strokes, annotation_groups = { group } }, { group_index = 1, pointer_type = "PEN", pointer_id = 0 })
+    return MyScript.strokes_from_pencil({ strokes = self.store.strokes, annotation_groups = { group } }, { group_index = 1, pointer_type = "PEN", pointer_id = 0 })
 end
 
 function Pencil:showRecognizedText(text, group)
@@ -4884,7 +4734,7 @@ function Pencil:setAnnotationGroupText(group, text, engine)
     group.transcription_engine = source
 
     for _, stroke_index in ipairs(group.stroke_indices or {}) do
-        local stroke = self.strokes[stroke_index]
+        local stroke = self.store.strokes[stroke_index]
         if stroke then
             stroke.transcription = text
             stroke.transcription_group_id = group.id
@@ -5052,7 +4902,6 @@ function Pencil:showAllRecognizedText()
         text_settings = {},
     })
 end
-
 
 -- Edit every annotation that currently has text. One MultiInput field is bound
 -- to one group directly, avoiding fragile parsing of page labels or separators.
@@ -5272,7 +5121,7 @@ function Pencil:captureGroupImage(group)
 
     -- Render this group's strokes over the painted page background.
     for _, idx in ipairs(group.stroke_indices or {}) do
-        local stroke = self.strokes[idx]
+        local stroke = self.store.strokes[idx]
         if stroke then
             self:renderStrokeOffset(off_bb, stroke, -x0, -y0)
         end
@@ -5313,36 +5162,9 @@ function Pencil:captureGroupImage(group)
     return true
 end
 
--- Variant of renderStroke that translates points by (dx, dy) before drawing.
--- Used during capture to render a group's strokes onto an offscreen buffer
--- whose origin corresponds to the bbox top-left.
 function Pencil:renderStrokeOffset(bb, stroke, dx, dy)
-    if not stroke or not stroke.points or #stroke.points < 1 then return end
-
-    local tool = stroke.tool or TOOL_PEN
-    local width = stroke.width or self.tool:getToolSettings(tool).width or 3
-    local color = stroke.color or self.tool:getToolSettings(tool).color or Blitbuffer.COLOR_BLACK
-
-    if Screen.night_mode and stroke.color_name ~= "Black" and stroke.color_name ~= "Gray" then
-        color = color:invert()
-    end
-
-    if tool == TOOL_HIGHLIGHTER then
-        self:paintHighlighterStroke(bb, stroke, dx, dy)
-        return
-    end
-
-    if #stroke.points == 1 then
-        local p = stroke.points[1]
-        local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(p.x + dx - half_w, p.y + dy - half_w, width, width, color)
-    else
-        for i = 2, #stroke.points do
-            local p1 = stroke.points[i - 1]
-            local p2 = stroke.points[i]
-            self:drawLineSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
-        end
-    end
+    self.stroke_render_ctx.night_mode = Screen.night_mode
+    PencilStrokes.render(bb, stroke, self.stroke_render_ctx, dx, dy)
 end
 
 -- Schedule a deferred capture for the group. If a capture is already pending
@@ -5517,7 +5339,7 @@ end
 function Pencil:getGroupColor(group)
     if not group or not group.stroke_indices then return nil end
     for _, idx in ipairs(group.stroke_indices) do
-        local stroke = self.strokes[idx]
+        local stroke = self.store.strokes[idx]
         if stroke and stroke.color then
             return stroke.color
         end
@@ -5547,7 +5369,7 @@ end
 -- Page-anchored (PDF) strokes render correctly in any rotation, so their
 -- groups never need a rotation badge.
 function Pencil:isGroupPageAnchored(group)
-    local first = group.stroke_indices and self.strokes[group.stroke_indices[1]]
+    local first = group.stroke_indices and self.store.strokes[group.stroke_indices[1]]
     return first ~= nil and first.page_points ~= nil
 end
 
@@ -5692,38 +5514,10 @@ function Pencil:installBookmarkHook()
     logger.info("Pencil: installed bookmark list hook")
 end
 
--- Rebuild page index from strokes
-function Pencil:rebuildPageIndex()
-    self.page_strokes = {}
-    for i, stroke in ipairs(self.strokes) do
-        self:indexStroke(i, stroke.page)
-    end
-end
-
--- Get strokes for a specific page
-function Pencil:getStrokesForPage(page)
-    local result = {}
-    local indices = self.page_strokes[page] or {}
-    for _, idx in ipairs(indices) do
-        if self.strokes[idx] then
-            table.insert(result, self.strokes[idx])
-        end
-    end
-    return result
-end
-
--- Check if current page has strokes
-function Pencil:hasStrokesOnCurrentPage()
-    local page = self:getCurrentPage()
-    return self.page_strokes[page] and #self.page_strokes[page] > 0
-end
-
--- Clear strokes on current page
 function Pencil:clearPageStrokes()
-    local page = self:getCurrentPage()
-    local indices_to_remove = self.page_strokes[page]
+    local deleted_strokes = self.store:clearPage(self:getCurrentPage())
 
-    if not indices_to_remove or #indices_to_remove == 0 then
+    if not deleted_strokes then
         UIManager:show(InfoMessage:new{
             text = _("No annotations found on this page."),
             timeout = 1,
@@ -5731,26 +5525,6 @@ function Pencil:clearPageStrokes()
         return
     end
 
-    -- Copy and sort in reverse order to maintain indices during removal
-    local sorted_indices = {}
-    for _, idx in ipairs(indices_to_remove) do
-        table.insert(sorted_indices, idx)
-    end
-    table.sort(sorted_indices, function(a, b) return a > b end)
-
-    local deleted_strokes = {}
-    for _, idx in ipairs(sorted_indices) do
-        if self.strokes[idx] then
-            table.insert(deleted_strokes, self.strokes[idx])
-            table.remove(self.strokes, idx)
-        end
-    end
-
-    if #deleted_strokes > 0 then
-        self:pushUndo({ type = "delete", strokes = deleted_strokes })
-    end
-
-    self:rebuildPageIndex()
     self:rebuildAnnotationGroups()
     self:saveStrokes()
 
@@ -5769,8 +5543,7 @@ function Pencil:clearAllStrokes()
         self:cancelGroupImageCapture(group.id)
         self:removeGroupImage(group)
     end
-    self.strokes = {}
-    self.page_strokes = {}
+    self.store:clearAll()
     self.annotation_groups = {}
     self:saveStrokes()
     -- Belt-and-suspenders: any leftover files get reaped.
@@ -6111,7 +5884,7 @@ function Pencil:saveCurrentPageToPdf()
     end
 
     local page = self:getCurrentPage()
-    local strokes = self:getStrokesForPage(page)
+    local strokes = self.store:forPage(page)
     local highlights = self:getPageTextHighlights(page)
     if #strokes == 0 and #highlights == 0 then
         UIManager:show(InfoMessage:new{
@@ -6264,7 +6037,7 @@ function Pencil:deleteEmbeddedAnnotationsFor(strokes)
     local deleted = 0
     for pageno in pairs(affected) do
         local keep_ids = {}
-        for _, stroke in ipairs(self.strokes) do
+        for _, stroke in ipairs(self.store.strokes) do
             if stroke.page == pageno and stroke.embedded and stroke.annot_id then
                 keep_ids[stroke.annot_id] = true
             end
@@ -6332,7 +6105,7 @@ function Pencil:autoSaveInkToPdf()
 
     local just_embedded = {}
     local touched_pages = {}
-    for _, stroke in ipairs(self.strokes) do
+    for _, stroke in ipairs(self.store.strokes) do
         if not stroke.embedded and stroke.page then
             local points = self:strokeToPagePoints(stroke)
             if #points >= 1 then
@@ -6360,7 +6133,7 @@ function Pencil:autoSaveInkToPdf()
     -- from an interrupted earlier session), so the file mirrors the live list.
     for pageno in pairs(touched_pages) do
         local keep_ids = {}
-        for _, stroke in ipairs(self.strokes) do
+        for _, stroke in ipairs(self.store.strokes) do
             if stroke.page == pageno and stroke.embedded and stroke.annot_id then
                 keep_ids[stroke.annot_id] = true
             end
@@ -6382,149 +6155,18 @@ function Pencil:autoSaveInkToPdf()
     return #just_embedded
 end
 
--- Render a line segment using rectangles (since BlitBuffer has no native line drawing)
--- Rasterize a thick line by stamping width×width squares along the segment.
--- Steps by ~half the pen width (via Geometry.segmentStepCount) so the squares
--- overlap without the ~width-fold per-pixel overdraw that stepping by 1px gives.
-function Pencil:drawThickLine(bb, x1, y1, x2, y2, width, color)
-    local dx = x2 - x1
-    local dy = y2 - y1
-    local dist = math.sqrt(dx * dx + dy * dy)
-    local half_w = math.floor(width / 2)
-
-    if dist < 1 then
-        -- Just draw a single point
-        bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, color)
-        return
-    end
-
-    -- Inclusive 0..steps loop emits both endpoints (t=0 and t=1).
-    local steps = PencilGeometry.segmentStepCount(dist, width)
-    for i = 0, steps do
-        local t = i / steps
-        local x = math.floor(x1 + dx * t)
-        local y = math.floor(y1 + dy * t)
-        bb:paintRectRGB32(x - half_w, y - half_w, width, width, color)
-    end
-end
-
-function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
-    self:drawThickLine(bb, x1, y1, x2, y2, width, color)
-end
-
--- Highlighter strokes are translucent: they are blended into the page, never
--- painted over it, so the text underneath stays readable. Returns
--- blend(x, y, w, h) for the given color and alpha (0-255).
---   * normal screen: multiply by the color mixed with white at `alpha`, the way
---     KOReader draws its own colored highlights (text stays dark, and on white
---     paper the result is the color at `alpha`);
---   * inverted screen (software night mode): alpha-blend the inverted color,
---     as KOReader does, because multiply doesn't work on a dark background;
---   * KOReader without multiplyRectRGB: plain alpha-blend; without any blend
---     support: paint the color mixed with white, opaque.
-function Pencil:getHighlighterBlender(bb, color, alpha)
-    alpha = alpha or 0xFF
-    local c = (color or Blitbuffer.Color8(0xDD)):getColorRGB32()
-    local r, g, b = c.r, c.g, c.b
-    local k = alpha / 255
-    local function mixWithWhite()
-        return Blitbuffer.ColorRGB32(
-            math.floor(255 - (255 - r) * k + 0.5),
-            math.floor(255 - (255 - g) * k + 0.5),
-            math.floor(255 - (255 - b) * k + 0.5), 0xFF)
-    end
-
-    if bb.getInverse and bb:getInverse() == 1 and bb.blendRectRGB32 then
-        local over = Blitbuffer.ColorRGB32(r, g, b, alpha):invert()
-        return function(x, y, w, h) bb:blendRectRGB32(x, y, w, h, over) end
-    elseif bb.multiplyRectRGB then
-        local mul = mixWithWhite()
-        return function(x, y, w, h) bb:multiplyRectRGB(x, y, w, h, mul) end
-    elseif bb.blendRectRGB32 then
-        local over = Blitbuffer.ColorRGB32(r, g, b, alpha)
-        return function(x, y, w, h) bb:blendRectRGB32(x, y, w, h, over) end
-    end
-    local opaque = mixWithWhite()
-    return function(x, y, w, h) bb:paintRectRGB32(x, y, w, h, opaque) end
-end
-
--- Blend a whole highlighter stroke into bb (shifted by dx, dy). Every pixel is
--- blended once, however much the brush stamps overlap. The covered rectangles
--- are cached on the stroke (they only depend on its points and width).
-function Pencil:paintHighlighterStroke(bb, stroke, dx, dy)
-    local points = stroke.points
-    if not points or #points < 1 then return end
-    local width = stroke.width or self.tool:getToolSettings(TOOL_HIGHLIGHTER).width or 20
-    local cache = stroke.hl_cache
-    if not cache or cache.n ~= #points or cache.width ~= width then
-        cache = {
-            n = #points,
-            width = width,
-            rects = PencilGeometry.strokeCoverageRects(points, width),
-        }
-        stroke.hl_cache = cache
-    end
-    local blend = self:getHighlighterBlender(bb, stroke.color, stroke.alpha)
-    dx, dy = dx or 0, dy or 0
-    for _, r in ipairs(cache.rects) do
-        blend(r.x + dx, r.y + dy, r.w, r.h)
-    end
-end
-
--- Draw the next piece (x1,y1 -> x2,y2; x1,y1 == x2,y2 for the first point) of the
--- highlighter stroke being written straight into the screen buffer. Only the
--- pixels not blended yet are blended, so overlapping stamps don't darken.
-function Pencil:drawLiveHighlighter(stroke, x1, y1, x2, y2)
-    local live = self.live_highlighter
-    if not live or live.stroke ~= stroke then
-        live = {
-            stroke = stroke,
-            cov = PencilGeometry.newCoverage(),
-            blend = self:getHighlighterBlender(Screen.bb, stroke.color, stroke.alpha),
-        }
-        self.live_highlighter = live
-    end
-    local width = stroke.width
-    local stamps = PencilGeometry.segmentStamps(x1, y1, x2, y2, width)
-    for i = 1, #stamps, 2 do
-        local rects = PencilGeometry.coverageAddRect(live.cov, stamps[i], stamps[i + 1], width, width, true)
-        for _, r in ipairs(rects) do
-            live.blend(r.x, r.y, r.w, r.h)
-        end
-    end
-end
-
--- Check if a point is near a stroke (for eraser)
-function Pencil:isPointNearStroke(px, py, stroke, threshold)
-    return PencilGeometry.isPointNearStroke(px, py, stroke, threshold)
-end
-
 -- Screen-space refresh rect (x, y, w, h) covering a set of just-deleted
 -- strokes, expanded by the eraser width and clamped to the screen. Returns
 -- nil when no stroke has geometry, signalling the caller to refresh fully.
 function Pencil:erasedStrokesRefreshRect(strokes)
-    if type(strokes) ~= "table" or #strokes == 0 then return nil end
-    local bbox = nil
-    for _, s in ipairs(strokes) do
-        local b = PencilGeometry.computeStrokeBbox(s)
-        if b then
-            bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
-        end
-    end
-    if not bbox then return nil end
-    local margin = self.tool:getToolSettings(TOOL_ERASER).width or 20
-    bbox = PencilGeometry.bboxExpand(bbox, margin)
-    bbox = PencilGeometry.bboxClampToScreen(bbox, Screen:getWidth(), Screen:getHeight())
-    local w = bbox.x1 - bbox.x0
-    local h = bbox.y1 - bbox.y0
-    if w <= 0 or h <= 0 then return nil end
-    return bbox.x0, bbox.y0, w, h
+    return PencilStrokes.erasedRefreshRect(strokes,
+        self.tool:getToolSettings(TOOL_ERASER).width or 20, Screen:getWidth(), Screen:getHeight())
 end
 
 -- Erase strokes at a given point
 -- Returns array of deleted strokes (for undo), or nil if none
 -- Drop removed strokes from each group's stroke_indices and renumber the
--- rest to match self.strokes after table.remove.
+-- rest to match self.store.strokes after table.remove.
 -- @param removed array of removed stroke indices (any order)
 function Pencil:shiftGroupStrokeIndices(removed)
     local sorted = {}
@@ -6586,125 +6228,40 @@ function Pencil:refreshAfterErase(deleted, fast)
 end
 
 function Pencil:eraseAtPoint(x, y, page, defer_groups)
-    -- Only erase strokes on the current page
-    if self.input_debug_mode then
-        self:writeDebugLog(string.format("ERASE: searching %d strokes at (%d, %d)",
-            #self.strokes, x, y))
-    end
-
-    if #self.strokes == 0 then
-        if self.input_debug_mode then
-            self:writeDebugLog("ERASE: no strokes exist")
-        end
-        return nil
-    end
-
-    local eraser_width = self.tool:getToolSettings(TOOL_ERASER).width
-    local deleted = {}
-    local indices_to_remove = {}
-
-    -- Iterate only strokes on the visible pages via the page index. Keeps the
-    -- per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
-    -- Legacy screen-space strokes are only drawn on the current page, so
-    -- they're only erasable there.
+    -- Only strokes on the visible pages can be erased. Legacy screen-space
+    -- strokes are only drawn on the current page, so they're only erasable there.
     local pages = self.ui and self.ui.paging and self:getVisiblePages() or { page }
-    for _, p in ipairs(pages) do
-        local page_indices = self.page_strokes and self.page_strokes[p] or {}
-        for _, i in ipairs(page_indices) do
-            local stroke = self.strokes[i]
-            local erasable = stroke and (stroke.page_points and self:syncStrokeToView(stroke)
-                or (not stroke.page_points and p == page))
-            if erasable then
-                if self.input_debug_mode and stroke.points and #stroke.points > 0 then
-                    local min_x, max_x, min_y, max_y = stroke.points[1].x, stroke.points[1].x, stroke.points[1].y, stroke.points[1].y
-                    for _, pt in ipairs(stroke.points) do
-                        if pt.x < min_x then min_x = pt.x end
-                        if pt.x > max_x then max_x = pt.x end
-                        if pt.y < min_y then min_y = pt.y end
-                        if pt.y > max_y then max_y = pt.y end
-                    end
-                    self:writeDebugLog(string.format("ERASE: stroke %d bounds: (%d-%d, %d-%d), eraser at (%d,%d) threshold=%d",
-                        i, min_x, max_x, min_y, max_y, x, y, eraser_width))
-                end
-                if self:isPointNearStroke(x, y, stroke, eraser_width) then
-                    table.insert(deleted, stroke)
-                    table.insert(indices_to_remove, i)
-                    if self.input_debug_mode then
-                        self:writeDebugLog(string.format("ERASE: found stroke %d to delete", i))
-                    end
-                end
-            end
-        end
-    end
+    local deleted, indices = self.store:eraseAtPoint(x, y, pages,
+        self.tool:getToolSettings(TOOL_ERASER).width,
+        function(stroke, p)
+            return stroke.page_points and self:syncStrokeToView(stroke)
+                or (not stroke.page_points and p == page)
+        end)
+    if not deleted then return nil end
 
-    -- Remove strokes (in reverse order to maintain indices)
-    if #indices_to_remove > 0 then
-        table.sort(indices_to_remove, function(a, b) return a > b end)
-        for _, idx in ipairs(indices_to_remove) do
-            table.remove(self.strokes, idx)
-        end
-        self:rebuildPageIndex()
-        if defer_groups then
-            -- Rebuilding groups re-creates every group bookmark in the book,
-            -- far too slow to do per eraser sample. Keep group indices valid
-            -- now and rebuild once in finishEraseGesture.
-            self:shiftGroupStrokeIndices(indices_to_remove)
-            self.groups_stale = true
-        else
-            self:rebuildAnnotationGroups()
-        end
-        if self.input_debug_mode then
-            self:writeDebugLog(string.format("ERASE: deleted %d strokes", #deleted))
-        end
-        -- Delete the baked-in PDF ink annotations for any embedded strokes we
-        -- just erased. Done HERE (the single choke point every eraser input
-        -- path funnels through) rather than at the various gesture-end sites,
-        -- so it works for the stylus-eraser, hardware-button and touch paths
-        -- alike. In-memory delete + tile refresh; the disk write is deferred to
-        -- flushPdfEdits() on close.
-        self:deleteEmbeddedAnnotationsFor(deleted)
-        return deleted
+    if defer_groups then
+        -- Rebuilding groups re-creates every group bookmark in the book,
+        -- far too slow to do per eraser sample. Keep group indices valid
+        -- now and rebuild once in finishEraseGesture.
+        self:shiftGroupStrokeIndices(indices)
+        self.groups_stale = true
+    else
+        self:rebuildAnnotationGroups()
     end
-
-    return nil
+    -- Delete the baked-in PDF ink annotations for any embedded strokes we
+    -- just erased. Done HERE (the single choke point every eraser input
+    -- path funnels through) rather than at the various gesture-end sites,
+    -- so it works for the stylus-eraser, hardware-button and touch paths
+    -- alike. In-memory delete + tile refresh; the disk write is deferred to
+    -- flushPdfEdits() on close.
+    self:deleteEmbeddedAnnotationsFor(deleted)
+    return deleted
 end
 
 -- Render a complete stroke
 function Pencil:renderStroke(bb, stroke)
-    if not stroke.points or #stroke.points < 1 then
-        return
-    end
-
-    local tool = stroke.tool or TOOL_PEN
-    local width = stroke.width or self.tool:getToolSettings(tool).width or 3
-
-    -- Get color directly (it's already a Blitbuffer color)
-    local color = stroke.color or self.tool:getToolSettings(tool).color or Blitbuffer.COLOR_BLACK
-
-    -- Reinvert color in night mode (if it's not black or gray)
-    if Screen.night_mode and stroke.color_name ~= "Black" and stroke.color_name ~= "Gray" then
-        color = color:invert()
-    end
-
-    -- Highlighter: translucent, blended with its own color and alpha
-    if tool == TOOL_HIGHLIGHTER then
-        self:paintHighlighterStroke(bb, stroke, 0, 0)
-        return
-    end
-
-    if #stroke.points == 1 then
-        -- Single point (dot)
-        local p = stroke.points[1]
-        local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
-    else
-        -- Multiple points - draw line segments
-        for i = 2, #stroke.points do
-            local p1 = stroke.points[i - 1]
-            local p2 = stroke.points[i]
-            self:drawLineSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
-        end
-    end
+    self.stroke_render_ctx.night_mode = Screen.night_mode
+    PencilStrokes.render(bb, stroke, self.stroke_render_ctx)
 end
 
 -- View module paintTo method - called by ReaderView during repaints.
@@ -6794,8 +6351,8 @@ function Pencil:paintTo(bb, x, y)
     -- never treated as stale; legacy screen-space strokes only draw on the
     -- current page.
     for _, p in ipairs(self:getVisiblePages()) do
-        for _, idx in ipairs(self.page_strokes[p] or {}) do
-            local stroke = self.strokes[idx]
+        for _, idx in ipairs(self.store.page_strokes[p] or {}) do
+            local stroke = self.store.strokes[idx]
             -- Skip strokes already embedded into the PDF: MuPDF renders the
             -- baked-in ink annotation, so drawing our overlay copy too would
             -- double it (and it wouldn't rotate correctly).
@@ -6833,102 +6390,25 @@ function Pencil:paintTo(bb, x, y)
     end
 end
 
--- Get the pencil strokes file path for this document
 function Pencil:getStrokesFilePath()
-    if not self.ui or not self.ui.doc_settings then
-        logger.warn("Pencil: doc_settings not available")
-        return nil
-    end
-    local sidecar_dir = self.ui.doc_settings.doc_sidecar_dir
-    if sidecar_dir then
-        return sidecar_dir .. "/pencil_strokes.lua"
-    end
-    logger.warn("Pencil: sidecar_dir not available")
-    return nil
-end
-
--- Store the plugin-owned strokes file path in the document metadata.
-function Pencil:rememberStrokesFilePath(filepath)
-    local settings = self.ui and self.ui.doc_settings
-    if settings and filepath then
-        settings:saveSetting(STROKES_PATH_SETTING, filepath)
-    end
-end
-
--- Recover pencil_strokes.lua after KOReader moves metadata.lua to a new
--- sidecar following a document rename. Both paths are assumed to be on the
--- same filesystem, so os.rename provides an atomic move.
-function Pencil:migrateStrokesFileIfNeeded()
-    local current = self:getStrokesFilePath()
-    local settings = self.ui and self.ui.doc_settings
-    if not current or not settings then return current end
-
-    if lfs.attributes(current, "mode") == "file" then
-        self:rememberStrokesFilePath(current)
-        return current
-    end
-
-    local previous = settings:readSetting(STROKES_PATH_SETTING)
-    if type(previous) ~= "string" or previous == "" or previous == current
-            or lfs.attributes(previous, "mode") ~= "file" then
-        return current
-    end
-
-    local old_sidecar = previous:match("^(.*)/[^/]+$")
-    local moved, err = os.rename(previous, current)
-    if not moved then
-        logger.warn("Pencil: failed to move strokes file from", previous,
-            "to", current, "error:", err)
-        return current
-    end
-
-    self:rememberStrokesFilePath(current)
-    logger.info("Pencil: moved strokes file from", previous, "to", current)
-
-    -- rmdir only succeeds when the legacy sidecar is empty. If KOReader or
-    -- another plugin left data there, it is preserved without extra handling.
-    if old_sidecar then
-        local removed = lfs.rmdir(old_sidecar)
-        if removed then
-            logger.info("Pencil: removed empty legacy sidecar", old_sidecar)
-        end
-    end
-
-    return current
+    return PencilStrokes.getFilePath(self.ui and self.ui.doc_settings)
 end
 
 -- Load strokes from our own file
 function Pencil:loadStrokes()
     self.notes = {}
-    local filepath = self:migrateStrokesFileIfNeeded()
+    local doc_settings = self.ui and self.ui.doc_settings
+    local filepath = PencilStrokes.migrateFileIfNeeded(doc_settings)
     logger.info("Pencil: loadStrokes - filepath =", filepath)
 
-    if not filepath then
-        logger.warn("Pencil: no filepath available for loading strokes")
-        self.strokes = {}
-        self.page_strokes = {}
-        return
-    end
+    local status, data = self.store:load(filepath, {
+        tool_settings = self.stroke_render_ctx.tool_settings,
+        available_colors = self.available_colors,
+    })
 
-    -- Check if file exists
-    local file_exists = io.open(filepath, "r")
-    if not file_exists then
-        logger.info("Pencil: strokes file does not exist yet:", filepath)
-        self.strokes = {}
-        self.page_strokes = {}
-        self.strokes_loaded = true
-        return
-    end
-    file_exists:close()
-
-    local ok, data = pcall(dofile, filepath)
-    if ok and data and data.strokes then
-        -- Convert saved strokes back to usable format
-        self.strokes = {}
-        for i, saved in ipairs(data.strokes) do
-            self.strokes[i] = self:strokeFromSaved(saved)
-        end
-        self:rebuildPageIndex()
+    if status == "error" then
+        self.annotation_groups = {}
+    elseif status == "ok" then
         self.notes = self:notesFromSaved(data.notes)
 
         -- Load annotation groups or bootstrap from v1 data
@@ -6941,7 +6421,7 @@ function Pencil:loadStrokes()
             logger.info("Pencil: bootstrapping annotation groups from strokes")
             self.annotation_groups = {}
             local sorted = {}
-            for i, stroke in ipairs(self.strokes) do
+            for i, stroke in ipairs(self.store.strokes) do
                 table.insert(sorted, { idx = i, dt = stroke.datetime or 0 })
             end
             table.sort(sorted, function(a, b) return a.dt < b.dt end)
@@ -6950,149 +6430,24 @@ function Pencil:loadStrokes()
             end
         end
 
-        self.strokes_loaded = true
-        self:rememberStrokesFilePath(filepath)
-        logger.info("Pencil: loaded", #self.strokes, "strokes from", filepath)
-    else
-        logger.warn("Pencil: failed to load strokes from", filepath, "error:", data)
-        self.strokes = {}
-        self.page_strokes = {}
-        self.annotation_groups = {}
+        PencilStrokes.rememberFilePath(doc_settings, filepath)
     end
 end
 
--- Convert stroke for saving (remove non-serializable values)
-function Pencil:strokeToSaveable(stroke)
-    return {
-        page = stroke.page,
-        tool = stroke.tool,
-        width = stroke.width,
-        alpha = stroke.alpha,
-        datetime = stroke.datetime,
-        -- v4: points packed as a single "x y x y ..." string instead of an
-        -- array of {x=,y=} tables, so the serializer doesn't walk every point.
-        p = PencilGeometry.packPoints(stroke.points),
-        -- PDF strokes: page coordinates, the source of truth for rendering.
-        pp = stroke.page_points and PencilGeometry.packPoints(stroke.page_points) or nil,
-        color_name = stroke.color_name,  -- Save color name for persistence
-        embedded = stroke.embedded,      -- true once written into the PDF file
-        annot_id = stroke.annot_id,      -- tag of its PDF annotation (for the eraser)
-        transcription = stroke.transcription,
-        transcription_group_id = stroke.transcription_group_id,
-        transcription_language = stroke.transcription_language,
-        transcription_datetime = stroke.transcription_datetime,
-        transcription_engine = stroke.transcription_engine,
-    }
-end
-
--- Convert saved stroke back to usable format
-function Pencil:strokeFromSaved(saved)
-    local tool = saved.tool or TOOL_PEN
-    local tool_settings = self.tool:getToolSettings(tool)
-
-    -- Look up color from color_name
-    local color = tool_settings.color
-    if saved.color_name then
-        for _, color_info in ipairs(self.available_colors) do
-            if color_info.name == saved.color_name then
-                color = color_info.color
-                break
-            end
-        end
-    end
-
-    -- Highlighter strokes saved before the highlighter had a choosable color have
-    -- no color name: they keep the opaque light gray they were drawn with, and
-    -- must not follow the highlighter color chosen now.
-    local alpha = saved.alpha or tool_settings.alpha
-    if tool == TOOL_HIGHLIGHTER and not saved.color_name then
-        color = Blitbuffer.Color8(0xDD)
-        alpha = 0xFF
-    end
-
-    -- Points: v4 stores a packed "x y ..." string in `p`; v3 and earlier store
-    -- an array of {x=,y=} tables in `points`. Reconstruct the in-memory
-    -- {x=,y=} array either way.
-    local points
-    if saved.p ~= nil then
-        points = PencilGeometry.unpackPoints(saved.p)
-    else
-        points = saved.points or {}
-    end
-
-    local stroke = {
-        page = saved.page,
-        tool = saved.tool,
-        width = saved.width or tool_settings.width,
-        color = color,
-        color_name = saved.color_name,
-        alpha = alpha,
-        datetime = saved.datetime,
-        points = points,
-        embedded = saved.embedded,
-        annot_id = saved.annot_id,
-        transcription = saved.transcription,
-        transcription_group_id = saved.transcription_group_id,
-        transcription_language = saved.transcription_language,
-        transcription_datetime = saved.transcription_datetime,
-        transcription_engine = saved.transcription_engine,
-        page_points = saved.pp and PencilGeometry.unpackPoints(saved.pp) or nil,
-    }
-    stroke.bbox = PencilGeometry.computeStrokeBbox(stroke)
-    return stroke
-end
-
--- Save strokes to our own file
+-- Save strokes (and the annotation groups and notes) to our own file
 function Pencil:saveStrokes()
     local filepath = self:getStrokesFilePath()
-    logger.info("Pencil: saveStrokes - filepath =", filepath, "strokes count =", #self.strokes)
-
-    if not filepath then
-        logger.warn("Pencil: no filepath available for saving strokes")
-        return
-    end
-
-    -- Safety: don't save empty data if strokes were never successfully loaded
-    -- (prevents data loss if a crash causes save before load completes)
-    if #self.strokes == 0 and not self.strokes_loaded then
-        logger.warn("Pencil: refusing to save empty strokes (strokes never loaded)")
-        return
-    end
-
-
-    -- Convert strokes to saveable format (remove non-serializable values)
-    local saveable_strokes = {}
-    for i, stroke in ipairs(self.strokes) do
-        saveable_strokes[i] = self:strokeToSaveable(stroke)
-    end
-
-    -- Serialize and write. Version 5 keeps v4 packed points and adds optional
-    -- MyScript transcription metadata to strokes and annotation groups.
-    -- Version 4 packs each stroke's points into a single
-    -- "x y x y ..." string (field `p`) instead of an array of {x=,y=} tables,
-    -- cutting serialize time + file size on heavily-annotated documents. v3 and
-    -- earlier (points array) still load via strokeFromSaved's fallback.
-    local data = {
-        version = 5,
-        strokes = saveable_strokes,
+    if self.store:save(filepath, {
         annotation_groups = self.annotation_groups,
         notes = self:notesToSaveable(),
-    }
-
-    local f, err = io.open(filepath, "w")
-    if f then
-        f:write("return " .. require("dump")(data))
-        f:close()
-        self:rememberStrokesFilePath(filepath)
-        logger.info("Pencil: saved", #self.strokes, "strokes to", filepath)
-    else
-        logger.err("Pencil: failed to open file for writing:", filepath, "error:", err)
+    }) then
+        PencilStrokes.rememberFilePath(self.ui and self.ui.doc_settings, filepath)
     end
 end
 
 -- Handle document close
 function Pencil:onCloseDocument()
-    logger.info("Pencil: onCloseDocument called, strokes count =", #self.strokes)
+    logger.info("Pencil: onCloseDocument called, strokes count =", self.store:count())
 
     -- Cancel any pending refresh
     self:cancelPendingRefresh()
@@ -7104,8 +6459,7 @@ function Pencil:onCloseDocument()
     if self.current_stroke and #self.current_stroke.points >= 2 then
         logger.info("Pencil: saving in-progress stroke before close")
         self:anchorStrokeToPage(self.current_stroke)
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
+        self.store:add(self.current_stroke)
         self.current_stroke = nil
     end
 
@@ -7164,8 +6518,7 @@ function Pencil:onCloseDocument()
 
     -- Clear state
     self.eraser_deleted = nil
-    self.undo_stack = {}
-    self.redo_stack = {}
+    self.store:clearHistory()
 
     if _active_pencil == self then _active_pencil = nil end
 end
@@ -7185,10 +6538,10 @@ function Pencil:onReaderReady()
     end
 
     -- Force reload strokes (in case they weren't loaded in init)
-    if #self.strokes == 0 then
+    if self.store:count() == 0 then
         self:loadStrokes()
     end
-    logger.info("Pencil: after loadStrokes, strokes count =", #self.strokes,
+    logger.info("Pencil: after loadStrokes, strokes count =", self.store:count(),
         "groups =", #self.annotation_groups)
 
     -- Sync annotation group bookmarks now that UI modules are ready
@@ -7209,7 +6562,7 @@ end
 function Pencil:onReadSettings(config)
     logger.dbg("Pencil: onReadSettings called")
     -- Only load if not already loaded
-    if not self.strokes or #self.strokes == 0 then
+    if self.store:count() == 0 then
         self:loadStrokes()
     end
     -- Re-setup touch zones if enabled (in case they were torn down)
@@ -7224,12 +6577,10 @@ function Pencil:onPageUpdate(pageno)
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
-        -- everything in self.strokes, so drop any queued debounced save first.
+        -- everything in self.store.strokes, so drop any queued debounced save first.
         self:cancelPendingSave()
         self:anchorStrokeToPage(self.current_stroke)
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
+        self.store:pushUndo({ type = "add", stroke_idx = self.store:add(self.current_stroke) })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
@@ -7251,9 +6602,7 @@ function Pencil:onUpdatePos()
     if self.current_stroke and #self.current_stroke.points >= 2 then
         self:cancelPendingSave()
         self:anchorStrokeToPage(self.current_stroke)
-        table.insert(self.strokes, self.current_stroke)
-        self:indexStroke(#self.strokes, self.current_stroke.page)
-        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
+        self.store:pushUndo({ type = "add", stroke_idx = self.store:add(self.current_stroke) })
         self:flushDirtyGroups()
         self:saveStrokes()
     else

@@ -27,7 +27,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -36,15 +36,14 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilTool = require("lib/penciltool")
+local PencilStrokes = require("lib/pencilstrokes")
 
 local function new_pencil()
     local p = setmetatable({
-        strokes = {},
-        page_strokes = {},
-        undo_stack = {},
-        redo_stack = {},
         view = {},
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.rebuildAnnotationGroups = function() end
     p.saveStrokes = function() end
     return p
@@ -52,14 +51,13 @@ end
 
 local function add(p, name)
     local stroke = { name = name, page = 1, points = { { x = 0, y = 0 } } }
-    table.insert(p.strokes, stroke)
-    p:pushUndo({ type = "add", stroke_idx = #p.strokes })
+    p.store:pushUndo({ type = "add", stroke_idx = p.store:add(stroke) })
     return stroke
 end
 
 local function names(p)
     local out = {}
-    for _, s in ipairs(p.strokes) do table.insert(out, s.name) end
+    for _, s in ipairs(p.store.strokes) do table.insert(out, s.name) end
     return out
 end
 
@@ -80,8 +78,8 @@ describe("undo / redo (real main.lua)", function()
         add(p, "b")
         add(p, "c")
         -- Erase "a": indices of b and c shift down by one.
-        table.remove(p.strokes, 1)
-        p:pushUndo({ type = "delete", strokes = { a } })
+        table.remove(p.store.strokes, 1)
+        p.store:pushUndo({ type = "delete", strokes = { a } })
         p:undoLastStroke() -- restores a
         p:undoLastStroke() -- removes c, not whatever sits at its old index
         assert.are.same({ "b", "a" }, names(p))
@@ -91,8 +89,8 @@ describe("undo / redo (real main.lua)", function()
         local p = new_pencil()
         local a = add(p, "a")
         add(p, "b")
-        table.remove(p.strokes, 1)
-        p:pushUndo({ type = "delete", strokes = { a } })
+        table.remove(p.store.strokes, 1)
+        p.store:pushUndo({ type = "delete", strokes = { a } })
         p:undoLastStroke()
         assert.are.same({ "b", "a" }, names(p))
         p:redoLastStroke()

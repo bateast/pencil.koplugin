@@ -25,7 +25,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -34,6 +34,16 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilTool = require("lib/penciltool")
+local PencilStrokes = require("lib/pencilstrokes")
+
+-- Rebuild a stroke from its saved form the way the plugin does on load
+local function load_saved(p, saved)
+    return PencilStrokes.fromSaved(saved, {
+        tool_settings = function(tool) return p.tool_settings[tool] or p.tool_settings.pen end,
+        available_colors = p.available_colors,
+    })
+end
 
 local function new_pencil()
     return setmetatable({
@@ -50,14 +60,14 @@ describe("stroke save format (real main.lua)", function()
     }
 
     it("saves points as a packed v4 string", function()
-        local saved = new_pencil():strokeToSaveable(stroke)
+        local saved = PencilStrokes.toSaveable(stroke)
         assert.are.equal("10 20 11 22 15 30", saved.p)
         assert.is_nil(saved.points)
     end)
 
     it("round-trips a stroke through save and load", function()
         local p = new_pencil()
-        local loaded = p:strokeFromSaved(p:strokeToSaveable(stroke))
+        local loaded = load_saved(p, PencilStrokes.toSaveable(stroke))
         assert.are.same(stroke.points, loaded.points)
         assert.are.equal(7, loaded.page)
         assert.are.equal(4, loaded.width)
@@ -65,7 +75,7 @@ describe("stroke save format (real main.lua)", function()
     end)
 
     it("still loads v3 strokes that store a points array", function()
-        local loaded = new_pencil():strokeFromSaved({
+        local loaded = load_saved(new_pencil(), {
             page = 2, tool = "pen", color_name = "Black",
             points = { { x = 1, y = 2 }, { x = 3, y = 4 } },
         })
@@ -73,7 +83,7 @@ describe("stroke save format (real main.lua)", function()
     end)
 
     it("loads a stroke with no points as an empty array", function()
-        local loaded = new_pencil():strokeFromSaved({ page = 1, tool = "pen" })
+        local loaded = load_saved(new_pencil(), { page = 1, tool = "pen" })
         assert.are.same({}, loaded.points)
     end)
 end)

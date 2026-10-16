@@ -48,7 +48,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -57,6 +57,9 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local function fire_scheduled()
     local fns = {}
@@ -76,20 +79,13 @@ local function new_pencil(opts)
     opts = opts or {}
     local saved = {}
     local p = setmetatable({
-        current_tool = "pen",
-        tool_settings = { pen = { color = { getColor8 = function() return { a = 0 } end }, color_name = "Black", width = 3, alpha = 1 } },
-        strokes = {},
-        undo_stack = {},
+        tool = make_tool(PencilTool, { tool_settings = { pen = { color = { getColor8 = function() return { a = 0 } end }, color_name = "Black", width = 3, alpha = 1 } } }),
         refresh_interval_ms = 16,
         input_debug_mode = false,
-        eraser_button_active = false,
-        swap_eraser_and_highlighter = false,
-        experimental_text_highlight = false,
         experimental_color_picker = false,
         experimental_pen_width = false,
         underline_hold = opts.underline_hold ~= false,
         side_button_down = false,
-        highlighting = false,
         pen_down = false,
         view = { paintTo = function() end },
         ui = {
@@ -113,12 +109,12 @@ local function new_pencil(opts)
             },
         },
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
     p.getCurrentPage = function() return 1 end
     p.paintTo = function() end
-    p.indexStroke = function() end
     p.assignStrokeToGroup = function() end
     p.scheduleDeferredWork = function() end
     p.scheduleDelayedRefresh = function() end
@@ -148,7 +144,7 @@ describe("underline by holding at line end (real main.lua)", function()
         assert.are.equal(100 + 2, saved[1].pos0.x)
         assert.is_true(saved[1].pos0.y >= 100 and saved[1].pos0.y <= 120)
         lift(p)
-        assert.are.equal(0, #p.strokes)
+        assert.are.equal(0, #p.store.strokes)
     end)
 
     it("keeps the ink when the pen lifts before the hold time", function()
@@ -157,7 +153,7 @@ describe("underline by holding at line end (real main.lua)", function()
         lift(p)
         fire_scheduled()
         assert.are.equal(0, #saved)
-        assert.are.equal(1, #p.strokes)
+        assert.are.equal(1, #p.store.strokes)
     end)
 
     it("ignores lines that are too short or too steep", function()
@@ -168,7 +164,7 @@ describe("underline by holding at line end (real main.lua)", function()
         draw(p, { { 100, 126 }, { 200, 200 } })
         fire_scheduled()
         assert.are.equal(0, #saved)
-        assert.are.equal(1, #p.strokes)
+        assert.are.equal(1, #p.store.strokes)
     end)
 
     it("keeps the ink when there is no text above the line", function()
@@ -177,7 +173,7 @@ describe("underline by holding at line end (real main.lua)", function()
         fire_scheduled()
         lift(p)
         assert.are.equal(0, #saved)
-        assert.are.equal(1, #p.strokes)
+        assert.are.equal(1, #p.store.strokes)
     end)
 
     it("does nothing when the option is off", function()
@@ -186,7 +182,7 @@ describe("underline by holding at line end (real main.lua)", function()
         fire_scheduled()
         lift(p)
         assert.are.equal(0, #saved)
-        assert.are.equal(1, #p.strokes)
+        assert.are.equal(1, #p.store.strokes)
     end)
 
     it("restarts the hold timer while the pen keeps moving", function()

@@ -73,7 +73,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -82,37 +82,32 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local function new_pencil(opts)
     opts = opts or {}
     local p = setmetatable({
-        current_tool = "pen",
-        tool_settings = {
+        tool = make_tool(PencilTool, { tool_settings = {
             pen = { color_name = "Black", width = 3, alpha = 1 },
             eraser = { width = 10 },
-        },
+        } }),
         available_colors = {},
-        strokes = {},
-        page_strokes = {},
         annotation_groups = {},
         notes = {},
-        undo_stack = {},
-        redo_stack = {},
         refresh_interval_ms = 16,
         input_debug_mode = false,
-        eraser_button_active = false,
-        swap_eraser_and_highlighter = false,
-        experimental_text_highlight = false,
         experimental_color_picker = false,
         experimental_pen_width = false,
         hold_menu = false,
         underline_hold = false,
         side_button_down = false,
-        highlighting = false,
         pen_down = false,
         view = opts.view or { paintTo = function() end },
         ui = opts.ui or { rolling = {}, document = {} },
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
@@ -150,7 +145,7 @@ describe("note canvas (real main.lua)", function()
         assert.are.equal("/body/p[3].12", note.xpointer)
         assert.are.equal(1, #note.pages[1].strokes)
         assert.are.equal(2, #note.pages[1].strokes[1].points)
-        assert.are.equal(0, #p.strokes) -- canvas ink never reaches the page
+        assert.are.equal(0, #p.store.strokes) -- canvas ink never reaches the page
         tap_bar(p, "done")
         assert.is_nil(p.note_canvas)
         assert.are.equal(1, #p.notes)

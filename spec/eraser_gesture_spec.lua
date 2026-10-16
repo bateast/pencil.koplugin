@@ -41,7 +41,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -49,7 +49,14 @@ local function load_pencil()
     return Pencil
 end
 
+-- KOReader global the plugin saves its settings through
+-- (main.lua is loaded with dofile, so it sees the real globals, not busted's)
+(getfenv and getfenv(0) or _G).G_reader_settings = { saveSetting = function() end, readSetting = function() end }
+
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local TOOL_TYPE_PEN = 1
 local TOOL_TYPE_ERASER = 2
@@ -69,18 +76,12 @@ local function new_pencil(opts)
         annotations[i] = { drawer = "lighten", pos0 = "a" .. i, pos1 = "b" .. i }
     end
     local p = setmetatable({
-        current_tool = "pen",
-        tool_settings = { pen = { width = 3 }, eraser = { width = 10 } },
-        strokes = { hline(0, 200, 100), hline(0, 200, 200), hline(0, 200, 300) },
+        tool = make_tool(PencilTool, { tool_settings = { pen = { width = 3 }, eraser = { width = 10 } } }),
         annotation_groups = {
             { id = "g1", stroke_indices = { 1, 2 } },
             { id = "g2", stroke_indices = { 3 } },
         },
-        undo_stack = {},
         input_debug_mode = false,
-        swap_eraser_and_highlighter = false,
-        experimental_text_highlight = false,
-        eraser_button_active = false,
         view = { paintTo = function() end },
         ui = {
             annotation = { annotations = annotations },
@@ -93,6 +94,8 @@ local function new_pencil(opts)
             },
         },
     }, { __index = Pencil })
+    p:initStrokeStore()
+    for _, stroke in ipairs({ hline(0, 200, 100), hline(0, 200, 200), hline(0, 200, 300) }) do p.store:add(stroke) end
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
@@ -105,7 +108,6 @@ local function new_pencil(opts)
         calls.saves = calls.saves + 1
         calls.stale_at_save = self.groups_stale
     end
-    p:rebuildPageIndex()
     return p, calls
 end
 
@@ -122,7 +124,7 @@ describe("stylus eraser gesture (real main.lua)", function()
         local p, calls = new_pencil()
         eraser(p, 50, 100)
         eraser(p, 50, 200)
-        assert.are.equal(1, #p.strokes)
+        assert.are.equal(1, #p.store.strokes)
         assert.are.equal(0, calls.rebuild_groups)
         eraser_lift(p)
         assert.are.equal(1, calls.rebuild_groups)
@@ -133,7 +135,7 @@ describe("stylus eraser gesture (real main.lua)", function()
         eraser(p, 50, 100)  -- removes stroke 1
         assert.are.same({ 1 }, p.annotation_groups[1].stroke_indices)
         assert.are.same({ 2 }, p.annotation_groups[2].stroke_indices)
-        assert.are.equal(300, p.strokes[p.annotation_groups[2].stroke_indices[1]].points[1].y)
+        assert.are.equal(300, p.store.strokes[p.annotation_groups[2].stroke_indices[1]].points[1].y)
     end)
 
     it("rebuilds groups before saving when switching back to the pen tip", function()

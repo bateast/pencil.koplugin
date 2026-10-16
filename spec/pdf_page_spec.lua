@@ -45,7 +45,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -54,6 +54,9 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 -- Fake ReaderView for a paged document.
 local function new_view(opts)
@@ -98,34 +101,35 @@ local function new_view(opts)
     return view
 end
 
+-- Rebuild a stroke from its saved form the way the plugin does on load
+local function load_saved(p, saved)
+    return PencilStrokes.fromSaved(saved, {
+        tool_settings = p.stroke_render_ctx.tool_settings,
+        available_colors = p.available_colors,
+    })
+end
+
 local function new_pencil(view, opts)
     opts = opts or {}
     local rendered = {}
     local p = setmetatable({
-        current_tool = "pen",
-        tool_settings = {
+        tool = make_tool(PencilTool, { tool_settings = {
             pen = { color = { getColor8 = function() return { a = 0 } end }, color_name = "Black", width = 3, alpha = 1 },
             eraser = { width = 10 },
-        },
+        } }),
         available_colors = {},
-        strokes = {},
-        page_strokes = {},
         annotation_groups = {},
-        undo_stack = {},
         refresh_interval_ms = 16,
         input_debug_mode = false,
-        eraser_button_active = false,
-        swap_eraser_and_highlighter = false,
-        experimental_text_highlight = false,
         experimental_color_picker = false,
         experimental_pen_width = false,
         underline_hold = false,
         side_button_down = false,
-        highlighting = false,
         pen_down = false,
         view = view,
         ui = opts.epub and { rolling = {}, view = view } or { paging = {}, view = view },
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
@@ -156,7 +160,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local view = new_view({ zoom = 2, ox = 100, oy = 50 })
         local p = new_pencil(view)
         draw(p, { { 300, 250 }, { 500, 250 } })
-        local s = p.strokes[1]
+        local s = p.store.strokes[1]
         assert.are.equal(1, s.page)
         assert.is_true(near(s.page_points[1].x, 100) and near(s.page_points[1].y, 100))
         assert.is_true(near(s.page_points[2].x, 200))
@@ -169,7 +173,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         view.state.zoom, view.state.offset = 1, { x = 0, y = 0 }
         p:paintTo(screen.bb, 0, 0)
         assert.are.same({ x = 100, y = 100 }, rendered[#rendered])
-        assert.are.equal(100, p.strokes[1].points[1].x)
+        assert.are.equal(100, p.store.strokes[1].points[1].x)
     end)
 
     it("erases a stroke at its new position after zooming, not the old one", function()
@@ -188,7 +192,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         p:handleStylusSlot(nil, { id = 1, x = 500, y = 250, tool = 1 })
         view.state.page, view.state.zoom = 2, 1
         p:onUpdatePos()
-        local s = p.strokes[1]
+        local s = p.store.strokes[1]
         assert.are.equal(1, s.page)
         assert.is_true(near(s.page_points[1].x, 100) and near(s.page_points[1].y, 100))
     end)
@@ -201,7 +205,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local view = new_view({ scroll = true, page = 3, page_states = states })
         local p, rendered = new_pencil(view)
         draw(p, { { 200, 700 }, { 300, 700 } }) -- 700 is past page 3 (600) + gap (8)
-        local s = p.strokes[1]
+        local s = p.store.strokes[1]
         assert.are.equal(4, s.page)
         assert.is_true(near(s.page_points[1].y, 92))
         p:paintTo(screen.bb, 0, 0)
@@ -221,9 +225,9 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local view = new_view({ zoom = 2, ox = 100, oy = 50 })
         local p = new_pencil(view)
         draw(p, { { 300, 250 }, { 500, 250 } })
-        local saved = p:strokeToSaveable(p.strokes[1])
+        local saved = PencilStrokes.toSaveable(p.store.strokes[1])
         assert.are.equal("100 100 200 100", saved.pp)
-        local loaded = p:strokeFromSaved(saved)
+        local loaded = load_saved(p, saved)
         assert.are.same({ { x = 100, y = 100 }, { x = 200, y = 100 } }, loaded.page_points)
     end)
 
@@ -231,7 +235,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local view = new_view({})
         local p = new_pencil(view, { epub = true })
         draw(p, { { 10, 10 }, { 60, 10 } })
-        assert.is_nil(p.strokes[1].page_points)
-        assert.is_nil(p:strokeToSaveable(p.strokes[1]).pp)
+        assert.is_nil(p.store.strokes[1].page_points)
+        assert.is_nil(PencilStrokes.toSaveable(p.store.strokes[1]).pp)
     end)
 end)

@@ -41,7 +41,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -50,26 +50,26 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local TOOL_TYPE_PEN = 1
 local TOOL_TYPE_HIGHLIGHTER = 3
 
 local function new_pencil(opts)
     local p = setmetatable({
-        current_tool = "pen",
-        experimental_text_highlight = opts.text_highlight,
-        swap_eraser_and_highlighter = false,
+        tool = make_tool(PencilTool, { text_highlight = opts.text_highlight }),
         input_debug_mode = false,
-        eraser_button_active = false,
-        highlighting = false,
-        undo_stack = {},
     }, { __index = Pencil })
+    p:initStrokeStore()
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.saveSettings = function() end
-    p.startTextHighlight = function(self) self.highlighting = true end
+    p.getCurrentPage = function() return 1 end
+    p.startTextHighlight = function(self) self.tool.highlighting = true; return true end
     p.extendTextHighlight = function() end
-    p.finishTextHighlight = function(self) self.highlighting = false end
+    p.finishTextHighlight = function(self) self.tool.highlighting = false end
     return p
 end
 
@@ -90,7 +90,7 @@ describe("stylus side button (real main.lua)", function()
     it("text highlight does not switch the tool to eraser", function()
         local p = new_pencil({ text_highlight = true })
         side_button_highlight(p)
-        assert.are.equal("pen", p.current_tool)
+        assert.are.equal("pen", p.tool.current_tool)
     end)
 
     it("text highlight does not show a tool toast", function()
@@ -106,18 +106,16 @@ describe("stylus side button (real main.lua)", function()
         p:onStylusButtonRelease()
         p:handleStylusSlot(nil, { id = 1, x = 50, y = 10, tool = TOOL_TYPE_PEN })
         p:handleStylusSlot(nil, { id = -1, tool = TOOL_TYPE_PEN })
-        assert.are.equal("pen", p.current_tool)
-        assert.is_false(p.highlighting)
+        assert.are.equal("pen", p.tool.current_tool)
+        assert.is_false(p.tool.highlighting)
     end)
 
-    it("quick press without drawing still toggles pen and eraser", function()
+    it("quick press without drawing does not switch the tool (the eraser role's click does)", function()
         local p = new_pencil({ text_highlight = true })
         p:onStylusButtonPress()
         p:onStylusButtonRelease()
-        assert.are.equal("eraser", p.current_tool)
-        assert.are.equal(1, #shown)
-        p:onStylusButtonPress()
-        p:onStylusButtonRelease()
-        assert.are.equal("pen", p.current_tool)
+        assert.are.equal("pen", p.tool.current_tool)
+        assert.are.equal(0, #shown)
+        assert.is_false(p.side_button_down)
     end)
 end)

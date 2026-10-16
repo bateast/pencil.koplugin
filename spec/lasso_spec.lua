@@ -60,7 +60,7 @@ local stubs = {
 
 local function load_pencil()
     table.insert(package.loaders, 2, function(name)
-        if name == "lib/geometry" then return nil end
+        if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -69,6 +69,9 @@ local function load_pencil()
 end
 
 local Pencil = load_pencil()
+local PencilStrokes = require("lib/pencilstrokes")
+local PencilTool = require("lib/penciltool")
+local make_tool = dofile("spec/helpers/make_tool.lua")
 
 local function hline(x0, x1, y)
     local pts = {}
@@ -78,24 +81,18 @@ end
 
 local function new_pencil()
     local p = setmetatable({
-        current_tool = "pen",
-        strokes = { hline(100, 300, 100), hline(100, 300, 500) },
-        page_strokes = {},
+        tool = make_tool(PencilTool),
         annotation_groups = {},
-        undo_stack = {},
-        redo_stack = {},
         refresh_interval_ms = 16,
         input_debug_mode = false,
-        eraser_button_active = false,
-        swap_eraser_and_highlighter = false,
-        experimental_text_highlight = false,
         side_button_down = false,
-        highlighting = false,
         pen_down = false,
         view = { paintTo = function() events.view_paints = events.view_paints + 1 end },
         ui = { dialog = "ReaderUI" },
         save_delay_ms = 1500,
     }, { __index = Pencil })
+    p:initStrokeStore()
+    for _, stroke in ipairs({ hline(100, 300, 100), hline(100, 300, 500) }) do p.store:add(stroke) end
     p.isEnabled = function() return true end
     p.isOverlayActive = function() return false end
     p.transformCoordinates = function(_, x, y) return x, y end
@@ -105,7 +102,6 @@ local function new_pencil()
     p.rebuilds = 0
     p.rebuildAnnotationGroups = function(self) self.rebuilds = self.rebuilds + 1 end
     p.saveStrokes = function() end
-    p:rebuildPageIndex()
     return p
 end
 
@@ -142,10 +138,10 @@ describe("lasso (real main.lua)", function()
         pen(p, buttons[1].x + 5, buttons[1].y + 5)
         lift(p)
         assert.is_nil(p.lasso)
-        assert.are.equal(1, #p.strokes)
-        assert.are.equal(500, p.strokes[1].points[1].y)
+        assert.are.equal(1, #p.store.strokes)
+        assert.are.equal(500, p.store.strokes[1].points[1].y)
         p:undoLastStroke()
-        assert.are.equal(2, #p.strokes)
+        assert.are.equal(2, #p.store.strokes)
     end)
 
     it("moves the selection by dragging inside the box, with undo and redo", function()
@@ -156,9 +152,9 @@ describe("lasso (real main.lua)", function()
         pen(p, 250, 160)
         lift(p)
         assert.is_nil(p.lasso)
-        local moved = p.strokes[1]
+        local moved = p.store.strokes[1]
         assert.are.same({ x = 150, y = 160 }, moved.points[1])
-        assert.are.same({ x = 100, y = 500 }, p.strokes[2].points[1])
+        assert.are.same({ x = 100, y = 500 }, p.store.strokes[2].points[1])
         p:undoLastStroke()
         assert.are.same({ x = 100, y = 100 }, moved.points[1])
         p:redoLastStroke()
@@ -167,7 +163,7 @@ describe("lasso (real main.lua)", function()
 
     it("moves page-anchored PDF strokes in page space", function()
         local p = new_pencil()
-        local s = p.strokes[1]
+        local s = p.store.strokes[1]
         s.page_points = {}
         for i, pt in ipairs(s.points) do s.page_points[i] = { x = pt.x / 2, y = pt.y / 2 } end
         s._vz, s._vox, s._voy = 2, 0, 0
@@ -199,7 +195,7 @@ describe("lasso (real main.lua)", function()
         pen(p, 900, 900)
         lift(p)
         assert.is_nil(p.lasso)
-        assert.are.equal(2, #p.strokes)
+        assert.are.equal(2, #p.store.strokes)
     end)
 
     it("runs hold-menu actions", function()
