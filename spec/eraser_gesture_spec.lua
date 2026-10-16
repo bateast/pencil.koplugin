@@ -111,7 +111,18 @@ local function new_pencil(opts)
     return p, calls
 end
 
-local function eraser(p, x, y) p:handleStylusSlot(nil, { id = 1, x = x, y = y, tool = TOOL_TYPE_ERASER }) end
+-- The eraser end erases by dragging; a touch that stays put is a click (it
+-- switches pen/eraser). So the first sample of a gesture comes with a short
+-- run-up that puts the contact beyond the click tolerance; later samples
+-- continue the same contact.
+local function eraser(p, x, y)
+    if not p.tool.eraser_contact then
+        p:handleStylusSlot(nil, { id = 1, x = x - 30, y = y, tool = TOOL_TYPE_ERASER })
+    end
+    p:handleStylusSlot(nil, { id = 1, x = x, y = y, tool = TOOL_TYPE_ERASER })
+end
+-- A touch that stays put
+local function eraser_touch(p, x, y) p:handleStylusSlot(nil, { id = 1, x = x, y = y, tool = TOOL_TYPE_ERASER }) end
 local function eraser_lift(p) p:handleStylusSlot(nil, { id = -1, tool = TOOL_TYPE_ERASER }) end
 local function pen_tip(p) p:handleStylusSlot(nil, { id = -1, tool = TOOL_TYPE_PEN }) end
 
@@ -152,8 +163,11 @@ describe("stylus eraser gesture (real main.lua)", function()
         local erase_calls = 0
         local real = p.eraseAtPoint
         p.eraseAtPoint = function(...) erase_calls = erase_calls + 1; return real(...) end
-        for _ = 1, 5 do eraser(p, 500, 500) end
-        assert.are.equal(1, erase_calls)
+        eraser(p, 500, 500)  -- the drag starts: erases where it came down and here
+        local after_start = erase_calls
+        assert.is_true(after_start >= 1)
+        for _ = 1, 4 do eraser(p, 500, 500) end
+        assert.are.equal(after_start, erase_calls)
     end)
 
     it("looks up highlight boxes once per gesture", function()
@@ -163,6 +177,33 @@ describe("stylus eraser gesture (real main.lua)", function()
         eraser_lift(p)
         eraser(p, 500, 600)
         assert.are.equal(8, calls.box_lookups)
+    end)
+
+    it("a click erases nothing and switches the tool; a drag does not", function()
+        local p = new_pencil()
+        eraser_touch(p, 50, 100)
+        eraser_touch(p, 52, 101)
+        eraser_lift(p)
+        assert.are.equal(3, #p.store.strokes)
+        assert.are.equal("eraser", p.tool.current_tool)
+        eraser(p, 50, 100)
+        eraser_lift(p)
+        assert.are.equal(2, #p.store.strokes)
+        assert.are.equal("eraser", p.tool.current_tool)  -- dragging did not switch it back
+    end)
+
+    it("rebuilds groups once, before saving, when the pen tip used as the eraser is lifted", function()
+        local p, calls = new_pencil()
+        p.tool.current_tool = "eraser"
+        p:handleStylusSlot(nil, { id = 1, x = 50, y = 100, tool = TOOL_TYPE_PEN })
+        p:handleStylusSlot(nil, { id = 1, x = 50, y = 200, tool = TOOL_TYPE_PEN })
+        assert.are.equal(1, #p.store.strokes)
+        assert.are.equal(0, calls.rebuild_groups)
+        p:handleStylusSlot(nil, { id = -1, tool = TOOL_TYPE_PEN })
+        assert.are.equal(1, calls.rebuild_groups)
+        assert.are.equal(1, calls.saves)
+        assert.is_false(calls.stale_at_save)
+        assert.is_true(p.store:canUndo())
     end)
 
     it("refreshes only the area of the erased stroke", function()

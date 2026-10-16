@@ -565,7 +565,15 @@ function Pencil:handleStylusSlot(input, slot)
             self:eraseWithEraserRole(contact.x0, contact.y0)
             self:eraseWithEraserRole(x, y)
         elseif phase == "drag" then
-            self:eraseWithEraserRole(x, y)
+            -- The digitizer reports at a high rate; only erase when the
+            -- eraser actually moved.
+            if x ~= self.pen_x or y ~= self.pen_y then
+                self:eraseWithEraserRole(x, y)
+            end
+        elseif phase == "drag_end" then
+            -- Eraser lifted off the screen (button/end still active)
+            self:finishEraseGesture()
+            UIManager:setDirty(self.view, "ui")
         elseif phase == "click" then
             self:onEraserClick()
         end
@@ -692,6 +700,7 @@ function Pencil:handleStylusSlot(input, slot)
             if self.pen_down and self.tool.erasing then
                 self.pen_down = false
                 self.tool.erasing = false
+                self:finishEraseGesture()
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
                     self.store:pushUndo({ type = "delete", strokes = self.eraser_deleted })
                     self:saveStrokes()
@@ -1978,19 +1987,13 @@ end
 -- the eraser end/button, remembering what was deleted for undo.
 function Pencil:eraseWithEraserRole(x, y)
     self.eraser_button_deleted = self.eraser_button_deleted or {}
-    local deleted = self:eraseAtPoint(x, y, self:getCurrentPage())
+    -- Group rebuilding is deferred to the end of the gesture (finishEraseGesture)
+    local deleted = self:eraseAtPoint(x, y, self:getCurrentPage(), true)
     if deleted then
         for _, stroke in ipairs(deleted) do
             table.insert(self.eraser_button_deleted, stroke)
         end
-        self.view:paintTo(Screen.bb, 0, 0)
-        self:paintTo(Screen.bb, 0, 0)
-        local rx, ry, rw, rh = self:erasedStrokesRefreshRect(deleted)
-        if rx then
-            Screen:refreshFast(rx, ry, rw, rh)
-        else
-            Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
-        end
+        self:refreshAfterErase(deleted, true)
     end
     -- Also remove any native KOReader text highlight at this position.
     -- removeItemByIndex emits AnnotationsModified and triggers its own
@@ -2011,6 +2014,7 @@ end
 -- Eraser mode ended (eraser end lifted or eraser button released): push what
 -- it deleted onto the undo stack and repaint.
 function Pencil:endEraserMode()
+    self:finishEraseGesture()
     if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
         self.store:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
         self:saveStrokes()
@@ -2050,6 +2054,7 @@ function Pencil:onKeyPress(key)
     -- BTN_TOOL_PEN - pen tip - deactivate eraser mode
     if key_str:match("BTN_TOOL_PEN") or key_str:match("ToolPen") then
         logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
+        self:finishEraseGesture()
         if self.tool.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
             self.store:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
@@ -2422,6 +2427,7 @@ function Pencil:scheduleDeferredWork()
             return
         end
         self:flushPendingGroups()
+        self:rebuildStaleGroups()
         self:flushDirtyGroups()
         self:saveStrokes()
     end
@@ -2455,13 +2461,14 @@ end
 -- Run any pending deferred work immediately. Called before close, page change,
 -- or any path that must persist state synchronously.
 function Pencil:flushDeferredWork()
-    if not self.pending_save
+    if not self.pending_save and not self.groups_stale
             and not (self.pending_group_strokes and #self.pending_group_strokes > 0)
             and not (self.dirty_groups and next(self.dirty_groups)) then
         return
     end
     self:cancelPendingSave()
     self:flushPendingGroups()
+    self:rebuildStaleGroups()
     self:flushDirtyGroups()
     self:saveStrokes()
 end
