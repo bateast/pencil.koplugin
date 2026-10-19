@@ -7,6 +7,8 @@ Run with: busted spec/pdf_page_spec.lua
 --]]--
 
 package.path = package.path .. ";pencil.koplugin/?.lua"
+-- Use the right package loader table for Lua 5.1+ compatibility
+local loaders = package.loaders or package.searchers
 
 -- A stub that accepts any field access or call and returns another stub.
 local function make_stub()
@@ -44,12 +46,12 @@ local stubs = {
 }
 
 local function load_pencil()
-    table.insert(package.loaders, 2, function(name)
+    table.insert(loaders, 2, function(name)
         if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
-    table.remove(package.loaders, 2)
+    table.remove(loaders, 2)
     return Pencil
 end
 
@@ -163,7 +165,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local s = p.store.strokes[1]
         assert.are.equal(1, s.page)
         assert.is_true(near(s.page_points[1].x, 100) and near(s.page_points[1].y, 100))
-        assert.is_true(near(s.page_points[2].x, 200))
+        assert.is_true(near(s.page_points[2].x, 200) and near(s.page_points[1].y, 100))
     end)
 
     it("follows a zoom and pan change when repainting", function()
@@ -226,7 +228,7 @@ describe("PDF page-anchored strokes (real main.lua)", function()
         local p = new_pencil(view)
         draw(p, { { 300, 250 }, { 500, 250 } })
         local saved = PencilStrokes.toSaveable(p.store.strokes[1])
-        assert.are.equal("100 100 200 100", saved.pp)
+        assert.are.equal("100.0 100.0 200.0 100.0", saved.pp)
         local loaded = load_saved(p, saved)
         assert.are.same({ { x = 100, y = 100 }, { x = 200, y = 100 } }, loaded.page_points)
     end)

@@ -6,6 +6,8 @@ Run with: busted spec/history_spec.lua
 --]]--
 
 package.path = package.path .. ";pencil.koplugin/?.lua"
+-- Use the right package loader table for Lua 5.1+ compatibility
+local loaders = package.loaders or package.searchers
 
 -- A stub that accepts any field access or call and returns another stub.
 local function make_stub()
@@ -26,12 +28,12 @@ local stubs = {
 }
 
 local function load_pencil()
-    table.insert(package.loaders, 2, function(name)
+    table.insert(loaders, 2, function(name)
         if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
-    table.remove(package.loaders, 2)
+    table.remove(loaders, 2)
     return Pencil
 end
 
