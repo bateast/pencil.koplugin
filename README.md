@@ -143,17 +143,89 @@ Additional safeguards:
 
 ### Rotation, zoom, and document moves
 
-- PDF strokes are anchored to page coordinates and follow zoom, pan, crop, continuous-page layouts, and rotation.
-- Legacy screen-space annotations retain preview-badge fallback behavior when their saved rotation no longer matches.
-- Pencil sidecar data follows a document when KOReader moves its metadata after a file rename.
+Writes pencil strokes into the PDF file as native ink annotations (`/Subtype /Ink`), so they
+travel with the file and are visible/removable in any PDF reader, not just re-drawn by this
+plugin. **PDF documents only.**
 
-### Storage and recovery
+**To use, two ways:**
+- **Manual, this page:** Pencil menu > Experimental > Save annotations to PDF (this page).
+  Adds the current page's pencil strokes **and** text highlights. Highlights already in the
+  file are skipped, and when KOReader's "Write highlights into PDF" is on they're left to
+  KOReader entirely.
+- **Automatic on close:** Pencil menu > Experimental > *Auto-save pencil ink to PDF on close*.
+  When enabled, every pencil stroke you've drawn (across all pages) is written into the PDF
+  when you close the document. Only strokes that aren't already in the file are added, so
+  re-opening never duplicates them.
 
-- Stores data per document in `pencil_strokes.lua` inside the document sidecar.
+Either way, the file itself is written **once, when you close the book**. Until then the ink
+is only in the open document, and the plugin doesn't record a stroke as saved until that
+write has succeeded. If KOReader is killed before a clean close, nothing is lost: the strokes
+are still drawn by the plugin and get saved on the next close.
+
+**Text highlights** are handled by KOReader itself, not this plugin's auto-save. KOReader
+draws its own copy of a highlight, so a plugin-embedded one would show doubled. To get text
+highlights into the PDF, enable KOReader's built-in feature: **top menu > Highlights > "Write
+highlights into PDF" > On** (long-press *On* to make it the default for all books). Use **"Write
+all highlights into PDF file"** in that same menu to push highlights you've already made.
+
+**Notes and limitations:**
+- **Placement.** Each stroke remembers where it sits on its page when you draw it, so
+  embedding is correct on every page, including PDFs with mixed page sizes and when you zoom
+  or pan between drawing and closing. Strokes drawn with an older version of the plugin learn
+  their page position the first time their page is shown.
+- **Embedded strokes are drawn by the PDF, not the overlay.** Once a stroke is in the PDF,
+  the plugin stops drawing its own copy. The PDF's baked-in ink is what you see (and it
+  rotates correctly).
+- **Erase, undo and clear work on embedded ink.** Erasing an embedded stroke, undoing it, or
+  using Clear page / Clear all removes its annotation from the PDF too (matched via a small tag
+  stored in the annotation's `/Contents`). Undoing an erase or a clear brings the strokes back
+  as normal overlay strokes, which are saved again on the next close.
+- **Ink from elsewhere is left alone.** The plugin only ever deletes the annotations of its
+  own strokes. Ink added in other apps, or by Pencil on another device, is never removed.
+- **Requires KOReader 2026.07 or newer.** Writing ink needs MuPDF ink symbols that
+  koreader-base only exports since
+  [koreader-base#2444](https://github.com/koreader/koreader-base/pull/2444), shipped in
+  KOReader 2026.07. Nothing extra to install on those builds, and the plugin patches **no
+  core KOReader files**. On older builds the feature degrades gracefully: the menu item
+  explains what's missing and does nothing to your file.
+
+Either way, the file itself is written **once, when you close the book**. Until then the ink
+is only in the open document, and the plugin doesn't record a stroke as saved until that
+write has succeeded. If KOReader is killed before a clean close, nothing is lost: the strokes
+are still drawn by the plugin and get saved on the next close.
+
+### Storage and - Stores data per document in `pencil_strokes.lua` inside the document sidecar.
 - Preserves compatibility with earlier stroke formats while writing compact format version 5.
 - Refuses to overwrite unloaded data with an empty save.
 - Flushes pending saves and image captures on page changes, close, and suspend.
 - Provides page-level and document-level clearing commands.
+
+**Text highlights** are handled by KOReader itself, not this plugin's auto-save. KOReader
+draws its own copy of a highlight, so a plugin-embedded one would show doubled. To get text
+highlights into the PDF, enable KOReader's built-in feature: **top menu > Highlights > "Write
+highlights into PDF" > On** (long-press *On* to make it the default for all books). Use **"Write
+all highlights into PDF file"** in that same menu to push highlights you've already made.
+
+**Notes and limitations:**
+- **Placement.** Each stroke remembers where it sits on its page when you draw it, so
+  embedding is correct on every page, including PDFs with mixed page sizes and when you zoom
+  or pan between drawing and closing. Strokes drawn with an older version of the plugin learn
+  their page position the first time their page is shown.
+- **Embedded strokes are drawn by the PDF, not the overlay.** Once a stroke is in the PDF,
+  the plugin stops drawing its own copy. The PDF's baked-in ink is what you see (and it
+  rotates correctly).
+- **Erase, undo and clear work on embedded ink.** Erasing an embedded stroke, undoing it, or
+  using Clear page / Clear all removes its annotation from the PDF too (matched via a small tag
+  stored in the annotation's `/Contents`). Undoing an erase or a clear brings the strokes back
+  as normal overlay strokes, which are saved again on the next close.
+- **Ink from elsewhere is left alone.** The plugin only ever deletes the annotations of its
+  own strokes. Ink added in other apps, or by Pencil on another device, is never removed.
+- **Requires KOReader 2026.07 or newer.** Writing ink needs MuPDF ink symbols that
+  koreader-base only exports since
+  [koreader-base#2444](https://github.com/koreader/koreader-base/pull/2444), shipped in
+  KOReader 2026.07. Nothing extra to install on those builds, and the plugin patches **no
+  core KOReader files**. On older builds the feature degrades gracefully: the menu item
+  explains what's missing and does nothing to your file.
 
 ### Diagnostics and gesture mapping
 
