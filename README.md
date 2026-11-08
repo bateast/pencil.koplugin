@@ -33,6 +33,14 @@ Rotating the device is handled: annotations written in the other orientation sho
 - **Per-document storage**: Annotations are saved with each book
 - **Annotation previews**: A picture of each annotation is saved, so it can be shown after rotating the device or from the Bookmarks menu. The Pencil menu shows how much space they use and can clear them for the current book
 - **Input debug mode**: Log raw stylus events to help diagnose detection issues
+- **Redo**: Redo what was undone (also from the hold-still menu below)
+- **Hold-still tool menu**: Hold the pen still on the page to open a menu with Undo, Redo, Lasso and Note (plus colors and widths when those options are on)
+- **Lasso**: Circle strokes to select them, then drag to move them or delete them
+- **Notes**: Write a note on a full-screen canvas from the hold-still menu; tap its marker on the page to reopen it
+- **Highlighter color and opacity**: Choose them in the Pencil menu under Highlighter (the default is the usual light gray)
+- **Ignore touch while writing**: Optionally ignore finger and palm contacts while the pen is near the screen
+- **Handwriting recognition**: Turn annotations into text with MyScript (needs your own MyScript keys, set in the Pencil menu > Handwriting recognition)
+- **Eraser click switches pen/eraser**: Optional, off by default. See [Eraser click mode](#eraser-click-mode)
 
 ## Instructions for Installation
 
@@ -71,6 +79,14 @@ If you can't update KOReader, use [release 0.5.0](https://github.com/mysticknits
    - **Pencil: select pencil** — switch to pencil
    - **Pencil: select eraser** — switch to eraser
    - **Pencil: undo** — undo last stroke or eraser action
+   - **Pencil: redo** — redo what was undone
+
+### Eraser click mode
+
+By default the eraser end erases whatever it touches, and a quick tap of the side button switches between pencil and eraser. If you prefer the stylus buttons the other way round, tick **Eraser click switches pen/eraser** in the Pencil menu:
+
+- **Eraser end**: a touch that stays put switches between pencil and eraser and erases nothing; dragging erases without changing the tool
+- **Side button**: only highlights (a KOReader text highlight with the experimental text highlight option, a freehand highlighter stroke where there is no text); a quick tap does nothing
 
 ## Questions or Issues with the Plugin
 
@@ -95,7 +111,7 @@ When enabled, the picker also shows pen width options (3, 5, 7, 9), rendered as 
 
 ### Text highlight (side button)
 
-When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead.
+When enabled, holding the stylus side button while dragging across words creates a KOReader text highlight, like long-pressing and choosing Highlight. When disabled, the side button draws a freehand highlighter stroke instead. (With [Eraser click mode](#eraser-click-mode) on, a freehand stroke is also drawn where there is no text under the pen.)
 
 **To enable:** Pencil menu > Experimental > Text highlight (side button)
 
@@ -116,6 +132,21 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 - All pencil bookmarks are removed from the Bookmarks menu
 - Your pencil strokes and drawings are not affected — only the bookmarks are removed
 - Annotation groups are still tracked internally, so you won't lose any grouping data if you turn it back on
+
+### Save annotations to PDF
+
+For PDF books, Pencil can write your ink into the PDF file as native ink annotations, so it shows in other PDF readers. Under **Pencil menu > Experimental**:
+
+- **Save annotations to PDF (this page)**: embeds this page's strokes and KOReader text highlights
+- **Auto-save pencil ink to PDF on close**: embeds every new stroke when you close the book
+
+Needs KOReader 2026.07 or newer with MuPDF ink support. Changes are written to the file once, when the book is closed.
+
+### Live black preview
+
+When enabled, colored pen strokes are drawn in black while you write, for faster feedback on color screens, and repainted in their color when you stop.
+
+**To enable:** Pencil menu > Experimental > Live black preview
 
 ## Features In the Pipeline
 
@@ -174,5 +205,7 @@ Every coffee helps keep Pencil growing. And if donating isn't your thing, starri
 ## Acknowledgements
 
 Eraser end detection based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
+
+Lasso, notes, palm rejection, the hold-still menu, native PDF ink export and handwriting recognition come from forks of this plugin; see the commit history for their authors.
 
 xoxo
