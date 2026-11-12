@@ -348,12 +348,12 @@ function M.addToMainMenu(self, menu_items)
                     },
                     {
                         text = _("Save annotations to PDF (this page)"),
-                        help_text = _("Write this page's pencil strokes (as ink annotations) and text highlights (as native highlight annotations) into the PDF file, so they travel with the file and are visible in any PDF reader. PDF documents only. Requires a KOReader build with MuPDF ink support (see the Pencil README)."),
+                        help_text = _("Add this page's pencil strokes (as ink annotations) and text highlights (as native highlight annotations) to the PDF, so they travel with the file and are visible in any PDF reader. The file is written when you close the book. Highlights already in the PDF are skipped. PDF documents only; requires KOReader 2026.07 or newer."),
                         keep_menu_open = true,
                         -- Always selectable for PDFs (it reports if there's
                         -- nothing on the page), so it's never hidden/greyed.
                         enabled_func = function()
-                            return self.ui.paging ~= nil
+                            return self:isPdfDocument()
                         end,
                         callback = function()
                             self:saveCurrentPageToPdf()
@@ -361,9 +361,9 @@ function M.addToMainMenu(self, menu_items)
                     },
                     {
                         text = _("Auto-save pencil ink to PDF on close"),
-                        help_text = _("When enabled, every pencil stroke you've drawn is written into the PDF file as a native ink annotation when you close the document, so your annotations travel with the file. Runs once per session (only new strokes are added). PDF documents only; requires a KOReader build with MuPDF ink support. Text highlights are not auto-saved — use the per-page action above for those."),
+                        help_text = _("When enabled, every pencil stroke you've drawn is written into the PDF file as a native ink annotation when you close the document, so your annotations travel with the file. Runs once per session (only new strokes are added). PDF documents only; requires KOReader 2026.07 or newer. Text highlights are not auto-saved — use the per-page action above for those."),
                         enabled_func = function()
-                            return self.ui.paging ~= nil and self:hasInkAnnotSupport()
+                            return self:isPdfDocument() and self:hasInkAnnotSupport()
                         end,
                         checked_func = function()
                             return self.auto_save_pdf == true

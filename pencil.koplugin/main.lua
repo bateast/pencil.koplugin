@@ -168,57 +168,23 @@ Pencil.editAllRecognizedText = PencilUI.editAllRecognizedText
 Pencil.showGroupImagePreview = PencilUI.showGroupImagePreview
 
 -- PDF export methods live in lib/pencilpdf.lua; public Pencil method names stay unchanged.
-function Pencil:hasInkAnnotSupport(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:hasInkAnnotSupport(...)
-end
-function Pencil:strokeToPagePoints(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:strokeToPagePoints(...)
-end
-function Pencil:strokeToInkOpts(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:strokeToInkOpts(...)
-end
-function Pencil:writeInkAnnotation(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:writeInkAnnotation(...)
-end
-function Pencil:getPageTextHighlights(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:getPageTextHighlights(...)
-end
-function Pencil:writeHighlightAnnotation(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:writeHighlightAnnotation(...)
-end
-function Pencil:flushPdfEdits(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:flushPdfEdits(...)
-end
-function Pencil:ensureHighlightAppearances(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:ensureHighlightAppearances(...)
-end
-function Pencil:saveCurrentPageToPdf(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:saveCurrentPageToPdf(...)
-end
-function Pencil:nextAnnotId(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:nextAnnotId(...)
-end
-function Pencil:_pruneInkAnnotsOnPage(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:_pruneInkAnnotsOnPage(...)
-end
-function Pencil:deleteEmbeddedAnnotationsFor(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:deleteEmbeddedAnnotationsFor(...)
-end
-function Pencil:autoSaveInkToPdf(...)
-    self.pdf_feature = self.pdf_feature or PencilPDF:new{ plugin = self }
-    return self.pdf_feature:autoSaveInkToPdf(...)
+for _, name in ipairs({
+    "hasInkAnnotSupport", "isPdfDocument", "canExportInk", "writablePdfDoc", "isReflowed",
+    "capturePagePoints", "recordPagePoints",
+    "strokeToInkOpts", "stageStrokesInk", "settleStagedStrokes",
+    "getPageTextHighlights", "pdfHasHighlight", "saveTextHighlightsToPdf", "deleteHighlightFromPdf",
+    "flushPdfEdits", "saveCurrentPageToPdf", "nextAnnotId",
+    "deleteEmbeddedAnnotationsFor", "applyPendingInkDeletes", "flushPendingEraseToPdf",
+    "autoSaveInkToPdf",
+}) do
+    Pencil[name] = function(self, ...)
+        local feature = rawget(self, "pdf_feature")
+        if not feature then
+            feature = PencilPDF:new{ plugin = self }
+            self.pdf_feature = feature
+        end
+        return feature[name](feature, ...)
+    end
 end
 
 -- The document's strokes, their page index and undo/redo history, and what
@@ -675,8 +641,7 @@ function Pencil:endRawStroke()
             self.current_stroke and #self.current_stroke.points or 0))
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
-        self:anchorStrokeToPage(self.current_stroke)
-        local stroke_idx = self.store:add(self.current_stroke)
+        local stroke_idx = self:commitStroke(self.current_stroke)
         self.store:pushUndo({ type = "add", stroke_idx = stroke_idx })
         self:assignStrokeToGroup(stroke_idx)
         self:scheduleDeferredWork()
@@ -970,11 +935,17 @@ function Pencil:eraseHighlightAtScreenPos(screen_x, screen_y)
     if not (self.ui and self.ui.highlight and self.ui.highlight.deleteHighlight) then
         return false
     end
+    local item = self.ui.annotation.annotations[index]
     local ok = pcall(self.ui.highlight.deleteHighlight, self.ui.highlight, index)
     -- Annotation indices and rendered boxes shift after a removal.
     self.highlight_box_cache = nil
     if ok then
         self._pdf_dirty = true
+        -- KOReader only deletes the PDF copy when "write highlights into PDF"
+        -- is on, but "Save annotations to PDF (this page)" can put it in the
+        -- file with that setting off. Remove whatever copy is still there.
+        local dok, derr = pcall(self.deleteHighlightFromPdf, self, item)
+        if not dok then logger.warn("Pencil: deleting highlight from PDF failed:", derr) end
         UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
     end
     return ok
@@ -1318,13 +1289,28 @@ function Pencil:afterHistoryChange()
     self:repaintReader()
 end
 
+-- The strokes an undo/redo is about to remove: undoing an "add", redoing a
+-- "delete". Their ink is taken out of the PDF too, if it was saved there.
+local function strokesLeaving(self, action, leaving_type)
+    if not action or action.type ~= leaving_type then return nil end
+    if leaving_type == "add" then
+        local stroke = action.stroke or (action.stroke_idx and self.store.strokes[action.stroke_idx])
+        return stroke and { stroke } or nil
+    end
+    return action.strokes
+end
+
 function Pencil:undoLastStroke()
+    local leaving = strokesLeaving(self, self.store.undo_stack[#self.store.undo_stack], "add")
+    if leaving then self:deleteEmbeddedAnnotationsFor(leaving) end
     if self.store:undo(self.stroke_translate) then
         self:afterHistoryChange()
     end
 end
 
 function Pencil:redoLastStroke()
+    local leaving = strokesLeaving(self, self.store.redo_stack[#self.store.redo_stack], "delete")
+    if leaving then self:deleteEmbeddedAnnotationsFor(leaving) end
     if self.store:redo(self.stroke_translate) then
         self:afterHistoryChange()
     end
@@ -1707,6 +1693,9 @@ end
 function Pencil:commitErase(deleted)
     if not deleted or #deleted == 0 then return end
     self.store:pushUndo({ type = "delete", strokes = deleted })
+    -- Every eraser input path ends here, so this is where the strokes' baked
+    -- PDF ink is removed: one page-tile refresh per gesture, not per hit.
+    self:deleteEmbeddedAnnotationsFor(deleted)
     -- Erasing defers the group rebuild; the bookmarks below need current groups.
     self:rebuildStaleGroups()
     self:flushDirtyGroups()
@@ -2049,8 +2038,7 @@ function Pencil:onDrawTap(ges)
     local stroke = PencilStrokes.newStroke(page, effective_tool, tool_settings,
         { { x = ges.pos.x, y = ges.pos.y } })
 
-    self:anchorStrokeToPage(stroke)
-    local stroke_idx = self.store:add(stroke)
+    local stroke_idx = self:commitStroke(stroke)
     self:saveStrokes()
 
     -- Add to undo stack
@@ -2205,8 +2193,7 @@ function Pencil:onDrawPanRelease()
     -- Fallback: finalize stroke via gesture system
     if #self.current_stroke.points >= 1 then
         -- Finalize the stroke
-        self:anchorStrokeToPage(self.current_stroke)
-        local stroke_idx = self.store:add(self.current_stroke)
+        local stroke_idx = self:commitStroke(self.current_stroke)
         self:saveStrokes()
 
         -- Add to undo stack
@@ -2267,11 +2254,30 @@ end
 -- Give a finished PDF stroke page coordinates (page_points). No-op for
 -- reflowable documents.
 function Pencil:anchorStrokeToPage(stroke)
-    if not (self.ui and self.ui.paging) or stroke.page_points then return end
+    if stroke.page_points ~= nil then return false end
+    -- Only real .pdf files are anchored, and not while reflowed
+    -- (recordPagePoints marks those).
+    if not (self.ui and self.ui.paging and self:isPdfDocument()) or self:isReflowed() then
+        stroke._anchor_page, stroke._anchor_zoom = nil, nil
+        stroke._anchor_ox, stroke._anchor_oy = nil, nil
+        return false
+    end
     if not stroke._anchor_zoom and stroke.points and stroke.points[1] then
         self:captureStrokeAnchor(stroke, stroke.points[1].x, stroke.points[1].y)
     end
-    PencilStrokes.anchorToPage(stroke)
+    return PencilStrokes.anchorToPage(stroke)
+end
+
+-- Add a finished stroke to the list and the page index, and record its page
+-- coordinates for PDF export while its page is still the one on screen
+-- (skipped when `view_moved`). Every drawing path commits through here.
+-- Returns the stroke's index.
+function Pencil:commitStroke(stroke, view_moved)
+    -- Anchor first: it can change the page the stroke belongs to
+    local anchored = self:anchorStrokeToPage(stroke)
+    local idx = self.store:add(stroke)
+    if not anchored and not view_moved then self:recordPagePoints(stroke) end
+    return idx
 end
 
 -- Bring a page-anchored stroke's screen points (stroke.points) in line with
@@ -3338,6 +3344,9 @@ function Pencil:clearPageStrokes()
         return
     end
 
+    -- The strokes' baked PDF ink goes too (undo then restores them as overlay
+    -- ink that re-embeds on the next save).
+    self:deleteEmbeddedAnnotationsFor(deleted_strokes)
     self:rebuildAnnotationGroups()
     self:flushDirtyGroups()
     self:refreshDogear()
@@ -3358,6 +3367,8 @@ function Pencil:clearAllStrokes()
         self:cancelGroupImageCapture(group.id)
         self:removeGroupImage(group)
     end
+    -- Remove every stroke's ink from the PDF as well.
+    self:deleteEmbeddedAnnotationsFor(self.store.strokes)
     self.store:clearAll()
     self.annotation_groups = {}
     self:refreshDogear()
@@ -3461,13 +3472,9 @@ function Pencil:eraseAtPoint(x, y, page, defer_groups)
     else
         self:rebuildAnnotationGroups()
     end
-    -- Delete the baked-in PDF ink annotations for any embedded strokes we
-    -- just erased. Done HERE (the single choke point every eraser input
-    -- path funnels through) rather than at the various gesture-end sites,
-    -- so it works for the stylus-eraser, hardware-button and touch paths
-    -- alike. In-memory delete + tile refresh; the disk write is deferred to
-    -- flushPdfEdits() on close.
-    self:deleteEmbeddedAnnotationsFor(deleted)
+    -- Embedded PDF ink for these strokes is removed once, at pen-up, by
+    -- commitErase (each removal regenerates the page tile, which would
+    -- flash the e-ink panel on every hit mid-gesture).
     return deleted
 end
 
@@ -3566,10 +3573,19 @@ function Pencil:paintTo(bb)
     for _, p in ipairs(self:getVisiblePages()) do
         for _, idx in ipairs(self.store.page_strokes[p] or {}) do
             local stroke = self.store.strokes[idx]
-            -- Skip strokes already embedded into the PDF: MuPDF renders the
+            -- Skip strokes embedded (or staged) into the PDF: MuPDF renders the
             -- baked-in ink annotation, so drawing our overlay copy too would
             -- double it (and it wouldn't rotate correctly).
-            if stroke and not stroke.embedded then
+            if stroke and not (stroke.embedded or stroke.staged) then
+                -- Strokes saved before page coordinates were recorded get
+                -- them now, under the same transform the overlay is drawn
+                -- with. Tried once per session so a stroke that can't be
+                -- mapped doesn't cost a transform on every repaint.
+                if stroke.page_points == nil and not stroke._page_points_tried
+                        and not self:isReflowed() then
+                    stroke._page_points_tried = true
+                    self:capturePagePoints(stroke)
+                end
                 if stroke.page_points then
                     if self:syncStrokeToView(stroke) then
                         self:renderStroke(bb, stroke)
@@ -3641,6 +3657,19 @@ function Pencil:loadStrokes()
     elseif status == "ok" then
         self.notes_feature:deserialize(data.notes)
 
+        -- { [tag] = page }: PDF ink deletions a session queued but didn't
+        -- write. All of them are still unapplied in this session's document.
+        self.pending_ink_deletes = {}
+        self._unapplied_ink_deletes = {}
+        if type(data.pending_ink_deletes) == "table" then
+            for tag, page in pairs(data.pending_ink_deletes) do
+                if type(tag) == "string" and type(page) == "number" then
+                    self.pending_ink_deletes[tag] = page
+                    self._unapplied_ink_deletes[tag] = page
+                end
+            end
+        end
+
         -- Load annotation groups or bootstrap from v1 data
         if data.annotation_groups and #data.annotation_groups > 0 then
             self.annotation_groups = data.annotation_groups
@@ -3670,6 +3699,9 @@ function Pencil:saveStrokes()
     if self.store:save(filepath, {
         annotation_groups = self.annotation_groups,
         notes = self.notes_feature and self.notes_feature:serialize() or {},
+        -- PDF ink deleted in memory but not yet written to the file.
+        pending_ink_deletes = (self.pending_ink_deletes and next(self.pending_ink_deletes))
+            and self.pending_ink_deletes or nil,
     }) then
         PencilStrokes.rememberFilePath(self.ui and self.ui.doc_settings, filepath)
     end
@@ -3688,8 +3720,7 @@ function Pencil:onCloseDocument()
     -- Save any in-progress stroke
     if self.current_stroke and #self.current_stroke.points >= 2 then
         logger.info("Pencil: saving in-progress stroke before close")
-        self:anchorStrokeToPage(self.current_stroke)
-        self.store:add(self.current_stroke)
+        self:commitStroke(self.current_stroke)
         self.current_stroke = nil
     end
 
@@ -3708,6 +3739,13 @@ function Pencil:onCloseDocument()
     -- Final bookmark sync before close
     self:syncAllBookmarks()
 
+    -- An erase gesture still in progress never reaches its pen-up handler.
+    self:flushPendingEraseToPdf()
+    -- Make sure every queued ink deletion is in the document for the write.
+    local pok, pres = pcall(self.applyPendingInkDeletes, self)
+    if not pok then logger.err("Pencil: applyPendingInkDeletes error:", pres) end
+    local deletes_applied = pok and pres ~= nil
+
     -- Auto-save pencil ink into the PDF file (opt-in). This only stages the
     -- annotations in memory; the actual disk write is the single flushPdfEdits()
     -- below. Must run while the document is still open/writable.
@@ -3718,12 +3756,6 @@ function Pencil:onCloseDocument()
         end
     end
 
-    -- Give KOReader's text highlights an appearance stream so they're visible in
-    -- desktop PDF viewers too (KOReader writes them without one). Staged only;
-    -- the flush below writes everything in one pass.
-    local hok, herr = pcall(function() self:ensureHighlightAppearances() end)
-    if not hok then logger.err("Pencil: ensureHighlightAppearances error:", herr) end
-
     -- Single, final write of any in-memory PDF edits the plugin made this
     -- session (auto-saved ink, erased ink, manual per-page saves). One
     -- incremental write, then is_edited is cleared so KOReader's own close
@@ -3731,16 +3763,17 @@ function Pencil:onCloseDocument()
     -- of the auto-save toggle, since the eraser/manual paths also set dirty.
     local ok, ferr = pcall(function() self:flushPdfEdits() end)
     if not ok then logger.err("Pencil: flushPdfEdits error:", ferr) end
-    -- flushPdfEdits clears _pdf_dirty on a successful write; if it's still set,
-    -- the write didn't happen, so un-embed the strokes we staged this close (the
-    -- sidecar must not claim they're in a file that never received them).
-    if self._pdf_dirty and self._auto_embedded_this_close then
-        for _, stroke in ipairs(self._auto_embedded_this_close) do
-            stroke.embedded = nil
-            stroke.annot_id = nil
-        end
+    -- flushPdfEdits clears _pdf_dirty only on a successful write. Only then do
+    -- strokes staged this session (by auto-save or the manual action) become
+    -- `embedded`; otherwise they're un-staged so the sidecar never claims ink
+    -- the file didn't receive, and the next close retries them.
+    self:settleStagedStrokes(not self._pdf_dirty)
+    -- Likewise the queued deletions are done once the file has them (or
+    -- nothing needed writing); otherwise they stay queued for next time.
+    if deletes_applied and not self._pdf_dirty then
+        self.pending_ink_deletes = {}
+        self._unapplied_ink_deletes = nil
     end
-    self._auto_embedded_this_close = nil
 
     -- Always save strokes on close (even if empty, to clear any previous data)
     logger.info("Pencil: saving strokes on document close")
@@ -3779,6 +3812,10 @@ function Pencil:onReaderReady()
     -- Sync annotation group bookmarks now that UI modules are ready
     self:syncAllBookmarks()
 
+    -- Finish PDF ink deletions an earlier session didn't get to write.
+    local pok, perr = pcall(self.applyPendingInkDeletes, self)
+    if not pok then logger.err("Pencil: applyPendingInkDeletes error:", perr) end
+
     -- Re-setup touch zones if enabled
     if self:isEnabled() and not self.touch_zones_registered then
         self:setupPenInput()
@@ -3814,8 +3851,7 @@ function Pencil:onPageUpdate()
         -- Save the stroke before clearing. The inline saveStrokes below covers
         -- everything in self.store.strokes, so drop any queued debounced save first.
         self:cancelPendingSave()
-        self:anchorStrokeToPage(self.current_stroke)
-        self.store:pushUndo({ type = "add", stroke_idx = self.store:add(self.current_stroke) })
+        self.store:pushUndo({ type = "add", stroke_idx = self:commitStroke(self.current_stroke, true) })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
@@ -3824,6 +3860,9 @@ function Pencil:onPageUpdate()
         self:flushDeferredWork()
     end
     self.current_stroke = nil
+    -- An erase gesture cut short by the page change never reaches its pen-up:
+    -- take the PDF ink of what it erased out now.
+    self:flushPendingEraseToPdf()
     self.eraser_deleted = nil
     -- Re-schedule capture for any group on the newly visible page that's
     -- still missing an image (e.g. user turned past the original page before
@@ -3836,14 +3875,14 @@ function Pencil:onUpdatePos()
     -- Clear any in-progress stroke when position changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         self:cancelPendingSave()
-        self:anchorStrokeToPage(self.current_stroke)
-        self.store:pushUndo({ type = "add", stroke_idx = self.store:add(self.current_stroke) })
+        self.store:pushUndo({ type = "add", stroke_idx = self:commitStroke(self.current_stroke, true) })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
         self:flushDeferredWork()
     end
     self.current_stroke = nil
+    self:flushPendingEraseToPdf()
     self.eraser_deleted = nil
     self:backfillMissingImages()
 end

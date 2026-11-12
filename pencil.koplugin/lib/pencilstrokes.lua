@@ -75,6 +75,31 @@ function PencilStrokes.liveColor(stroke, live_black_preview)
     return stroke.color
 end
 
+-- Round a page coordinate to 1/100 of a point: enough for any PDF, and a
+-- shorter sidecar.
+local function roundPageCoord(v)
+    return math.floor(v * 100 + 0.5) / 100
+end
+PencilStrokes.roundPageCoord = roundPageCoord
+
+-- Sidecar form of stroke.page_points: a packed string, false for a stroke drawn
+-- while reflowed (never to be mapped), or nil. page_points never change once
+-- recorded, so the packed string is kept on the stroke (_pp_packed) rather than
+-- rebuilt on every save.
+local function packPagePoints(stroke)
+    local points = stroke.page_points
+    if points == false then return false end
+    if not (points and #points > 0) then return nil end
+    stroke._pp_packed = stroke._pp_packed or PencilGeometry.packPoints(points)
+    return stroke._pp_packed
+end
+
+local function unpackPagePoints(pp)
+    if pp == false then return false end
+    if type(pp) == "string" and pp ~= "" then return PencilGeometry.unpackPoints(pp) end
+    return nil
+end
+
 -- Convert a stroke for saving (no non-serializable values)
 function PencilStrokes.toSaveable(stroke)
     return {
@@ -86,10 +111,15 @@ function PencilStrokes.toSaveable(stroke)
         -- v4: points packed as a single "x y x y ..." string instead of an
         -- array of {x=,y=} tables, so the serializer doesn't walk every point.
         p = PencilGeometry.packPoints(stroke.points),
-        -- PDF strokes: page coordinates, the source of truth for rendering.
-        pp = stroke.page_points and PencilGeometry.packPoints(stroke.page_points) or nil,
         color_name = stroke.color_name,  -- Save color name for persistence
-        embedded = stroke.embedded,      -- true once written into the PDF file
+        -- PDF strokes: points in native page coordinates (packed like `p`), the
+        -- source of truth for rendering and for PDF export (so embedding doesn't
+        -- depend on the page on screen at close), plus the zoom they were drawn
+        -- at. `embedded` is only set once the ink has actually been written to
+        -- the file (never while merely staged).
+        pp = packPagePoints(stroke),
+        pz = stroke.page_zoom,
+        embedded = stroke.embedded,
         annot_id = stroke.annot_id,      -- tag of its PDF annotation (for the eraser)
         transcription = stroke.transcription,
         transcription_group_id = stroke.transcription_group_id,
@@ -152,7 +182,9 @@ function PencilStrokes.fromSaved(saved, ctx)
         transcription_language = saved.transcription_language,
         transcription_datetime = saved.transcription_datetime,
         transcription_engine = saved.transcription_engine,
-        page_points = saved.pp and PencilGeometry.unpackPoints(saved.pp) or nil,
+        page_points = unpackPagePoints(saved.pp),
+        _pp_packed = type(saved.pp) == "string" and saved.pp ~= "" and saved.pp or nil,
+        page_zoom = saved.pz,
     }
     stroke.bbox = PencilGeometry.computeStrokeBbox(stroke)
     return stroke
@@ -165,17 +197,18 @@ end
 -- Give a finished stroke page coordinates (page_points) from the anchor it
 -- captured when it started (_anchor_page/_zoom/_ox/_oy: the page under its first
 -- point and that page's transform). Returns false if it has no anchor or already
--- has page points.
+-- has page points (recorded, or false: never to be mapped).
 function PencilStrokes.anchorToPage(stroke)
-    if stroke.page_points then return false end
+    if stroke.page_points ~= nil then return false end
     local zoom = stroke._anchor_zoom
     if not zoom then return false end
     local ox, oy = stroke._anchor_ox, stroke._anchor_oy
     local page_points = {}
     for i, pt in ipairs(stroke.points) do
-        page_points[i] = { x = (pt.x - ox) / zoom, y = (pt.y - oy) / zoom }
+        page_points[i] = { x = roundPageCoord((pt.x - ox) / zoom), y = roundPageCoord((pt.y - oy) / zoom) }
     end
     stroke.page_points = page_points
+    stroke.page_zoom = zoom
     stroke.page = stroke._anchor_page
     -- The screen points already match this view.
     stroke._vz, stroke._vox, stroke._voy = zoom, ox, oy

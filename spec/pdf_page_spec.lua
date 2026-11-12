@@ -48,7 +48,7 @@ local stubs = {
 local function load_pencil()
     table.insert(loaders, 2, function(name)
                      if name == "pencilinput" then return function() return dofile("pencil.koplugin/pencilinput.lua") end end
-                     if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
+                     if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" or name == "lib/pencilpdf" then return nil end
                      return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -130,7 +130,9 @@ local function new_pencil(view, opts)
         side_button_down = false,
         pen_down = false,
         view = view,
-        ui = opts.epub and { rolling = {}, view = view } or { paging = {}, view = view },
+        -- A real .pdf (what anchoring requires): its document is writable.
+        ui = opts.epub and { rolling = {}, view = view }
+            or { paging = {}, view = view, document = { is_pdf = true, _checkIfWritable = function() return true end } },
     }, { __index = Pencil })
     p:initStrokeStore()
     p.isEnabled = function() return true end

@@ -284,6 +284,8 @@ end
 function PencilLasso:deleteSelection()
     local selected = self.state.strokes
     self:clear()
+    -- Their baked PDF ink goes too (undo restores them as overlay ink).
+    self.plugin:deleteEmbeddedAnnotationsFor(selected)
     if self.plugin.store:removeStrokes(selected) then
         self.plugin.store:pushUndo({ type = "delete", strokes = selected })
     end
