@@ -34,6 +34,7 @@ local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local time = require("ui/time")
+local util = require("ffi/util")
 
 -- Check if device supports touch input
 if not Device:isTouchDevice() then
@@ -1289,8 +1290,12 @@ function Pencil:addToMainMenu(menu_items)
             },
             {
                 text = _("Handwriting recognition"),
+                help_text = _("Provides handscript recognition through Myscript cloud service. Push strokes to cloud and require a (free) Myscript developper account."),
                 sub_item_table = {
-                    { text = _("Configure MyScript"), callback = function() self:showMyScriptSettingsDialog() end },
+                    { text = _("Configure MyScript"),
+                      callback = function() self:showMyScriptSettingsDialog() end,
+                      help_text = _("Configure MyScript language and cloud keys. Require a (free) Myscript developper account"),
+                    },
                     { text = _("Recognize latest annotation group"),
                       enabled_func = function() return self:getLatestAnnotationGroupOnCurrentPage() ~= nil end,
                       callback = function() local g = self:getLatestAnnotationGroupOnCurrentPage(); if g then self:recognizeAnnotationGroup(g) end end },
@@ -2562,41 +2567,45 @@ function Pencil:showAnnotationHoldMenu(group)
 
     if text ~= "" then
         rows[#rows + 1] = {{
-            text = _("Show recognized text"),
+            text = _("Show annotation text"),
             callback = function()
                 UIManager:close(dialog)
                 self:showRecognizedText(text, group)
             end,
         }}
         rows[#rows + 1] = {{
-            text = _("Edit recognized text"),
+            text = _("Edit annotation text"),
             callback = function()
                 UIManager:close(dialog)
                 self:showAnnotationTextEditor(group)
             end,
         }}
-        rows[#rows + 1] = {{
-            text = _("Recognize again"),
-            callback = function()
-                UIManager:close(dialog)
-                self:recognizeAnnotationGroup(group)
-            end,
-        }}
+        if self.myscript_application_key and self.myscript_application_key ~= "" then
+            rows[#rows + 1] = {{
+                    text = _("Recognize again"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:recognizeAnnotationGroup(group)
+                    end,
+            }}
+        end
     else
         rows[#rows + 1] = {{
-            text = _("Create text"),
+            text = _("Create annotation text"),
             callback = function()
                 UIManager:close(dialog)
                 self:showAnnotationTextEditor(group)
             end,
         }}
-        rows[#rows + 1] = {{
-            text = _("Recognize this annotation"),
-            callback = function()
-                UIManager:close(dialog)
-                self:recognizeAnnotationGroup(group)
-            end,
-        }}
+        if self.myscript_application_key and self.myscript_application_key ~= "" then
+            rows[#rows + 1] = {{
+                    text = _("Recognize this annotation"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:recognizeAnnotationGroup(group)
+                    end,
+            }}
+        end
     end
 
     if group.image_path then
@@ -3232,8 +3241,12 @@ function Pencil:showMyScriptSettingsDialog()
         title = _("MyScript settings"),
         fields = {
             { description = _("Recognition language"), text = self.myscript_language or "en_US", hint = "en_US" },
-            { description = _("Application key"), text = self.myscript_application_key or "" },
-            { description = _("HMAC key"), text = self.myscript_hmac_key or "", text_type = "password" },
+            { description = _("Application key"), text = self.myscript_application_key or "",
+              help_text = _("Application specific identifier from MyScript Developper page. Stored plain text in Koreader settings."),
+},
+            { description = _("HMAC key"), text = self.myscript_hmac_key or "", text_type = "password",
+              help_text = _("Application specific secret from MyScript Developper page. Stored plain text in Koreader settings."),
+            },
         },
         buttons = {{
             { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
@@ -3388,31 +3401,63 @@ function Pencil:recognizeAnnotationGroup(group)
         return
     end
 
-    NetworkMgr:runWhenOnline(function()
-        local client, client_error = self:createMyScriptClient()
-        if not client then
+    NetworkMgr:runWhenOnline(
+        function()
+            local client, client_error = self:createMyScriptClient()
+            if not client then
+                UIManager:show(InfoMessage:new{
+                                   text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+                })
+                return
+            end
+
             UIManager:show(InfoMessage:new{
-                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+                               text = _("Recognizing handwriting..."),
+                               timeout = 1,
             })
-            return
-        end
 
-        UIManager:show(InfoMessage:new{
-            text = _("Recognizing handwriting..."),
-            timeout = 1,
-        })
+            -- Run recognition in a subprocess to avoid blocking UI
+            local _pid, pipe_fd = util.runInSubProcess(
+                function(_child_pid, write_fd)
+                    local text, error_value = self:recognizeGroupWithClient(client, group)
+                    local result = { text = text, error_value = error_value }
+                    -- Serialize result as JSON for communication
+                    local json = require("json")
+                    local output = json.encode(result)
+                    util.writeToFD(write_fd, output, true)
+                end,
+                true, false)
 
-        local text, error_value = self:recognizeGroupWithClient(client, group)
-        if not text then
-            local message = error_value and error_value.message or error_value
+        if pipe_fd then
+            local json = require("json")
+            local function check_pipe()
+                local avail = util.getNonBlockingReadSize(pipe_fd)
+                if avail and avail > 0 then
+                    -- Now safe to read all and block, since data is ready
+                    local output = util.readAllFromFD(pipe_fd)
+                    local result = json.decode(output)
+                    if not result.text then
+                        local message = result.error_value and result.error_value.message or result.error_value
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Recognition failed: %1"), tostring(message)),
+                        })
+                        return
+                    end
+                    group.transcription = result.text
+                    group.transcription_language = self.myscript_language
+                    self:saveStrokes()
+                    self:showRecognizedText(result.text, group)
+                else
+                    -- Schedule next check (using KOReader's timer)
+                    UIManager:scheduleIn(0.1, check_pipe)
+                end
+            end
+            check_pipe()
+        else
             UIManager:show(InfoMessage:new{
-                text = T(_("Recognition failed: %1"), tostring(message)),
+                text = _("Failed to start recognition subprocess."),
             })
-            return
         end
-
-        self:saveStrokes()
-        self:showRecognizedText(text, group)
     end)
 end
 
