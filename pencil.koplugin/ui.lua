@@ -302,12 +302,23 @@ function M.addToMainMenu(self, menu_items)
                     },
                     {
                         text = _("Highlight by holding at line end"),
-                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the ink is replaced by a native KOReader highlight (in your default highlight style) on the words above it."),
+                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the ink is replaced by a native KOReader highlight on the words above it (in your default highlight style, or as a blue underline if that option is on)."),
                         checked_func = function()
                             return self.underline_hold
                         end,
                         callback = function()
                             self.underline_hold = not self.underline_hold
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = _("Held line becomes a blue underline"),
+                        help_text = _("When enabled, a line you draw under text and hold still is converted into a long blue line below the text line, instead of a highlight over the words. Text selected with the highlighter, and highlights you make yourself in KOReader, keep your normal highlight style."),
+                        checked_func = function()
+                            return self.tool:isUnderlineTextHighlight()
+                        end,
+                        callback = function()
+                            self.tool:underlineTextHighlight()
                             self:saveSettings()
                         end,
                     },

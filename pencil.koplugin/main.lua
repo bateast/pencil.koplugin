@@ -606,6 +606,27 @@ function Pencil:findTextAbove(x, y)
     end
 end
 
+-- Save the current ReaderHighlight selection as a native highlight, in the
+-- style chosen in the menu (default: the reader's own highlight style).
+-- Used when a held line is turned into a highlight; text selected with the
+-- highlighter tool keeps the reader's own style.
+-- ReaderHighlight:saveHighlight builds the item from the view's saved_drawer
+-- and saved_color, so those are set for the duration of the call and restored
+-- afterwards: the reader's own highlight settings are never changed.
+-- @return ok, err of the protected call
+function Pencil:saveNativeHighlight(rh)
+    local drawer, color = self.tool:getNativeHighlightStyle()
+    local hl = drawer and self.ui.view and self.ui.view.highlight
+    if not hl then
+        return pcall(rh.saveHighlight, rh, false)
+    end
+    local old_drawer, old_color = hl.saved_drawer, hl.saved_color
+    hl.saved_drawer, hl.saved_color = drawer, color
+    local ok, err = pcall(rh.saveHighlight, rh, false)
+    hl.saved_drawer, hl.saved_color = old_drawer, old_color
+    return ok, err
+end
+
 -- Save a native KOReader highlight over the text above a stroke bbox.
 -- @return true if a highlight was saved
 function Pencil:underlineTextAbove(bbox)
@@ -621,11 +642,11 @@ function Pencil:underlineTextAbove(bbox)
     local ok, selected = pcall(self.ui.document.getTextFromPositions,
                                self.ui.document, start_pos, end_pos)
     if not (ok and selected and selected.pos0 and selected.pos1) then return false end
-    -- No drawer set: saveHighlight uses the reader's default highlight style.
+    -- The style is the reader's default one unless the underline option is on.
 
     local rh = self.ui.highlight
     rh.selected_text = selected
-    local saved, err = pcall(rh.saveHighlight, rh, false)
+    local saved, err = self:saveNativeHighlight(rh)
     if not saved then
         logger.warn("Pencil: saving underline failed:", tostring(err))
     end
@@ -836,6 +857,8 @@ function Pencil:finishTextHighlight()
         -- PDF/EPUB item-shape difference. It emits AnnotationsModified itself,
         -- so we do NOT emit a second one here — a userpatch may further wrap
         -- this call to prompt for color, but that's not the plugin's concern.
+        -- Always the reader's own highlight style: the underline option only
+        -- applies to a held line turned into a highlight (underlineTextAbove).
         local ok, err = pcall(rh.saveHighlight, rh, false)
         if not ok then
             logger.warn("Pencil: saveHighlight failed:", tostring(err))

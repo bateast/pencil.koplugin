@@ -40,7 +40,7 @@ Rotating the device is handled: annotations written in the other orientation sho
 - **Highlighter color and opacity**: Choose them in the Pencil menu under Highlighter (the default is the usual light gray)
 - **Ignore touch while writing**: Optionally ignore finger and palm contacts while the pen is near the screen
 - **Handwriting recognition**: Turn annotations into text with MyScript (needs your own MyScript keys, set in the Pencil menu > Handwriting recognition)
-- **Highlight by holding at line end**: Draw a line under text and rest the pen at its end: the ink becomes a native KOReader highlight on the words above
+- **Highlight by holding at line end**: Draw a line under text and rest the pen at its end: the ink becomes a native KOReader highlight on the words above (optionally a blue underline instead, see the Experimental menu)
 - **Eraser click switches pen/eraser**: Optional, off by default. See [Eraser click mode](#eraser-click-mode)
 
 ## Instructions for Installation

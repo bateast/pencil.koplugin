@@ -51,7 +51,7 @@ local stubs = {
 local function load_pencil()
     table.insert(loaders, 2, function(name)
                      if name == "pencilinput" then return function() return dofile("pencil.koplugin/pencilinput.lua") end end
-                     if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" then return nil end
+                     if name == "lib/geometry" or name == "lib/penciltool" or name == "lib/pencilstrokes" or name == "lib/pencilpdf" then return nil end
         return function() return stubs[name] or make_stub() end
     end)
     local Pencil = dofile("pencil.koplugin/main.lua")
@@ -81,7 +81,8 @@ end
 local function new_pencil(opts)
     opts = opts or {}
     local saved = {}
-    local p = setmetatable({
+    local p
+    p = setmetatable({
         tool = make_tool(PencilTool, { tool_settings = { pen = { color = { getColor8 = function() return { a = 0 } end }, color_name = "Black", width = 3, alpha = 1 } } }),
         refresh_interval_ms = 16,
         input_debug_mode = false,
@@ -94,6 +95,8 @@ local function new_pencil(opts)
         ui = {
             view = {
                 screenToPageTransform = function(_, pos) return { x = pos.x, y = pos.y, page = 1 } end,
+                -- ReaderView.highlight: what saveHighlight reads the style from
+                highlight = { saved_drawer = "lighten", saved_color = "yellow" },
             },
             document = {
                 getWordFromPosition = function(_, pos)
@@ -105,6 +108,9 @@ local function new_pencil(opts)
             },
             highlight = {
                 saveHighlight = function(rh)
+                    local style = p.ui.view.highlight
+                    rh.selected_text.drawer = style.saved_drawer
+                    rh.selected_text.color = style.saved_color
                     table.insert(saved, rh.selected_text)
                     return #saved
                 end,
@@ -143,11 +149,35 @@ describe("underline by holding at line end (real main.lua)", function()
         draw(p, { { 100, 126 }, { 200, 127 }, { 300, 126 }, { 400, 128 } })
         fire_scheduled()
         assert.are.equal(1, #saved)
-        assert.is_nil(saved[1].drawer) -- default highlight style
+        assert.are.equal("lighten", saved[1].drawer) -- the reader's default style
+        assert.are.equal("yellow", saved[1].color)
         assert.are.equal(100 + 2, saved[1].pos0.x)
         assert.is_true(saved[1].pos0.y >= 100 and saved[1].pos0.y <= 120)
         lift(p)
         assert.are.equal(0, #p.store.strokes)
+    end)
+
+    it("saves a blue underscore when the underline option is on", function()
+        local p, saved = new_pencil()
+        p.tool:underlineTextHighlight()
+        draw(p, { { 100, 126 }, { 200, 127 }, { 300, 126 }, { 400, 128 } })
+        fire_scheduled()
+        assert.are.equal(1, #saved)
+        assert.are.equal("underscore", saved[1].drawer)
+        assert.are.equal("blue", saved[1].color)
+        -- the reader's own highlight settings are left alone
+        assert.are.equal("lighten", p.ui.view.highlight.saved_drawer)
+        assert.are.equal("yellow", p.ui.view.highlight.saved_color)
+    end)
+
+    it("restores the reader's style even when saving fails", function()
+        local p = new_pencil()
+        p.tool:underlineTextHighlight()
+        p.ui.highlight.saveHighlight = function() error("boom") end
+        local ok = p:saveNativeHighlight(p.ui.highlight)
+        assert.is_false(ok)
+        assert.are.equal("lighten", p.ui.view.highlight.saved_drawer)
+        assert.are.equal("yellow", p.ui.view.highlight.saved_color)
     end)
 
     it("keeps the ink when the pen lifts before the hold time", function()
@@ -199,5 +229,33 @@ describe("underline by holding at line end (real main.lua)", function()
         assert.are.equal(first, next(scheduled)) -- same closure, rescheduled
         draw(p, { { 304, 127 } })                -- within the still tolerance
         assert.are.equal(first, next(scheduled))
+    end)
+end)
+
+describe("highlighter text selection (finishTextHighlight, real main.lua)", function()
+    local function pencil_with_selection(underline)
+        local p, saved = new_pencil()
+        if underline then p.tool:underlineTextHighlight() end
+        p.ui.highlight.selected_text = { text = "words", pos0 = { x = 1, y = 1 }, pos1 = { x = 2, y = 1 } }
+        p._clearTempSelection = function() end
+        p.tool.highlighting = true
+        return p, saved
+    end
+
+    it("uses the reader's default style by default", function()
+        local p, saved = pencil_with_selection(false)
+        p:finishTextHighlight()
+        assert.are.equal(1, #saved)
+        assert.are.equal("lighten", saved[1].drawer)
+        assert.is_false(p.tool.highlighting)
+    end)
+
+    it("keeps the reader's style even when the underline option is on", function()
+        -- The option is only for a held line turned into a highlight
+        local p, saved = pencil_with_selection(true)
+        p:finishTextHighlight()
+        assert.are.equal(1, #saved)
+        assert.are.equal("lighten", saved[1].drawer)
+        assert.are.equal("yellow", saved[1].color)
     end)
 end)

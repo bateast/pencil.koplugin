@@ -129,6 +129,7 @@ function PencilTool:init()
     -- Off (default): the stylus behaves as in the original Pencil. On: the
     -- eraser role clicks/drags, see isEraserClickMode().
     self.eraser_click_mode = false
+    self.underline_text_highlight = false
 
     return self
 end
@@ -152,6 +153,7 @@ function PencilTool:loadSettings(settings, available_colors, available_widths)
     self.swap_eraser_and_highlighter = settings.swap_eraser_and_highlighter or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
     self.eraser_click_mode = settings.eraser_click_mode or false
+    self.underline_text_highlight = settings.underline_text_highlight or false
 
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
@@ -207,6 +209,7 @@ function PencilTool:exportSettings()
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         experimental_text_highlight = self.experimental_text_highlight,
         eraser_click_mode = self.eraser_click_mode,
+        underline_text_highlight = self.underline_text_highlight,
         pen_color_name = pen.color_name,
         pen_width = pen.width,
         highlighter_color_name = hl.color_name,
@@ -319,6 +322,27 @@ function PencilTool:isExperimentalTextHighlight() return self.experimental_text_
 function PencilTool:experimentalTextHighlight()
     self.experimental_text_highlight = not self.experimental_text_highlight
     return self.experimental_text_highlight
+end
+
+-- Style of the native highlight a held line is converted into (a line drawn
+-- under text and held still). Off: KOReader's own default highlight style.
+-- On: a long blue line below the text (KOReader's "underscore" drawer in
+-- blue). Text selected with the highlighter tool is not affected.
+PencilTool.UNDERLINE_HIGHLIGHT = { drawer = "underscore", color = "blue" }
+
+function PencilTool:isUnderlineTextHighlight() return self.underline_text_highlight end
+function PencilTool:underlineTextHighlight()
+    self.underline_text_highlight = not self.underline_text_highlight
+    return self.underline_text_highlight
+end
+
+-- The drawer and color to save native highlights with, or nil, nil to keep
+-- the reader's default highlight style.
+function PencilTool:getNativeHighlightStyle()
+    if self.underline_text_highlight then
+        return PencilTool.UNDERLINE_HIGHLIGHT.drawer, PencilTool.UNDERLINE_HIGHLIGHT.color
+    end
+    return nil, nil
 end
 
 -- Reset transient highlighter state without changing the selected main tool.

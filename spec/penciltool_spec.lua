@@ -132,11 +132,13 @@ describe("PencilTool", function()
             tool:setWidth(5)
             tool:swapEraserHighlighter()
             tool:experimentalTextHighlight()
+            tool:underlineTextHighlight()
             local saved = tool:exportSettings()
             assert.same({
                 swap_eraser_and_highlighter = true,
                 experimental_text_highlight = true,
                 eraser_click_mode = false,
+                underline_text_highlight = true,
                 pen_color_name = "Red",
                 pen_width = 5,
                 highlighter_color_name = "Gray",
@@ -146,6 +148,31 @@ describe("PencilTool", function()
             local other = PencilTool:new()
             other:loadSettings(saved, colors, widths)
             assert.same(saved, other:exportSettings())
+        end)
+    end)
+
+    describe("native highlight style", function()
+        it("keeps the reader's default style unless the underline option is on", function()
+            assert.is_false(tool:isUnderlineTextHighlight())
+            assert.is_nil(tool:getNativeHighlightStyle())
+        end)
+
+        it("underlines in blue when the option is on", function()
+            assert.is_true(tool:underlineTextHighlight())
+            local drawer, color = tool:getNativeHighlightStyle()
+            assert.equals("underscore", drawer)
+            assert.equals("blue", color)
+            assert.is_false(tool:underlineTextHighlight())
+            assert.is_nil(tool:getNativeHighlightStyle())
+        end)
+
+        it("is saved and restored with the settings", function()
+            tool:underlineTextHighlight()
+            local other = PencilTool:new()
+            other:loadSettings(tool:exportSettings(), {}, {})
+            assert.is_true(other:isUnderlineTextHighlight())
+            other:loadSettings({}, {}, {})
+            assert.is_false(other:isUnderlineTextHighlight())
         end)
     end)
 
