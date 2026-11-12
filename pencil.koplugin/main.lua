@@ -37,6 +37,7 @@ local _ = require("gettext")
 local T = require("ffi/util").template
 local time = require("ui/time")
 local function trimString(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
+local util = require("ffi/util")
 
 -- Check if device supports touch input
 if not Device:isTouchDevice() then
@@ -2793,31 +2794,63 @@ function Pencil:recognizeAnnotationGroup(group)
         return
     end
 
-    NetworkMgr:runWhenOnline(function()
-        local client, client_error = self:createMyScriptClient()
-        if not client then
+    NetworkMgr:runWhenOnline(
+        function()
+            local client, client_error = self:createMyScriptClient()
+            if not client then
+                UIManager:show(InfoMessage:new{
+                                   text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+                })
+                return
+            end
+
             UIManager:show(InfoMessage:new{
-                text = T(_("Invalid MyScript configuration: %1"), tostring(client_error)),
+                               text = _("Recognizing handwriting..."),
+                               timeout = 1,
             })
-            return
-        end
 
-        UIManager:show(InfoMessage:new{
-            text = _("Recognizing handwriting..."),
-            timeout = 1,
-        })
+            -- Run recognition in a subprocess to avoid blocking UI
+            local _pid, pipe_fd = util.runInSubProcess(
+                function(_child_pid, write_fd)
+                    local text, error_value = self:recognizeGroupWithClient(client, group)
+                    local result = { text = text, error_value = error_value }
+                    -- Serialize result as JSON for communication
+                    local json = require("json")
+                    local output = json.encode(result)
+                    util.writeToFD(write_fd, output, true)
+                end,
+                true, false)
 
-        local text, error_value = self:recognizeGroupWithClient(client, group)
-        if not text then
-            local message = error_value and error_value.message or error_value
+        if pipe_fd then
+            local json = require("json")
+            local function check_pipe()
+                local avail = util.getNonBlockingReadSize(pipe_fd)
+                if avail and avail > 0 then
+                    -- Now safe to read all and block, since data is ready
+                    local output = util.readAllFromFD(pipe_fd)
+                    local result = json.decode(output)
+                    if not result.text then
+                        local message = result.error_value and result.error_value.message or result.error_value
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Recognition failed: %1"), tostring(message)),
+                        })
+                        return
+                    end
+                    group.transcription = result.text
+                    group.transcription_language = self.myscript_language
+                    self:saveStrokes()
+                    self:showRecognizedText(result.text, group)
+                else
+                    -- Schedule next check (using KOReader's timer)
+                    UIManager:scheduleIn(0.1, check_pipe)
+                end
+            end
+            check_pipe()
+        else
             UIManager:show(InfoMessage:new{
-                text = T(_("Recognition failed: %1"), tostring(message)),
+                text = _("Failed to start recognition subprocess."),
             })
-            return
         end
-
-        self:saveStrokes()
-        self:showRecognizedText(text, group)
     end)
 end
 
