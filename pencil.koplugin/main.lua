@@ -30,8 +30,6 @@ local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local TextViewer = require("ui/widget/textviewer")
-local NetworkMgr = require("ui/network/manager")
-local MyScript = require("lib/myscript")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
@@ -95,6 +93,13 @@ end)()
 -- Color picker trigger settings
 local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
 local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
+
+-- Underline by holding the pen at the end of a horizontal stroke
+local UNDERLINE_HOLD_MS = 600          -- How long the pen must rest at the end
+local UNDERLINE_STILL_PIXELS = 10      -- Movement allowed while resting
+local UNDERLINE_MIN_LENGTH = 40        -- Shorter strokes are never underlines
+local UNDERLINE_MAX_SLOPE = 0.25       -- Max stroke height / width
+local UNDERLINE_SEARCH_PIXELS = 48     -- How far above the stroke to look for text
 
 -- Annotation grouping constants
 local GROUP_TIME_THRESHOLD_S = 10   -- seconds between strokes to be grouped
@@ -658,23 +663,30 @@ function Pencil:routeStylusSlot(input, slot)
             self.erasing = false
             self:cancelPendingRefresh()
             self:cancelColorPickerTimer()
+            self:cancelUnderlineHold()
             self:startRawStroke(effective_tool)
             local x, y = self:transformCoordinates(slot.x or 0, slot.y or 0)
             self.pen_x, self.pen_y = x, y
             self:beginPickerTracking(x, y, effective_tool)
+            if self.input_debug_mode then self:writeDebugLog("=== PEN DOWN ===") end
         else
             local x, y = self:transformCoordinates(slot.x or self.pen_x, slot.y or self.pen_y)
             if x ~= self.pen_x or y ~= self.pen_y then
                 self:movePickerTracking(x, y)
-                if not overlay then self:addRawPoint(x, y) end
+                if not overlay then
+                    self:addRawPoint(x, y)
+                    self:trackUnderlineHold(x, y)
+                end
                 self.pen_x, self.pen_y = x, y
             end
         end
     elseif self.pen_down and not self.erasing then
         self.pen_down = false
         self:cancelColorPickerTimer()
+        self:cancelUnderlineHold()
         self:endRawStroke()
         self.highlight_freehand = false
+        if self.input_debug_mode then self:writeDebugLog("=== PEN UP ===") end
     end
     return true
 end
@@ -796,6 +808,115 @@ function Pencil:addRawPoint(x, y)
             self.dirty_region = nil
         end
     end
+end
+
+-- Refresh the screen area drawn since the last refresh, if any.
+function Pencil:refreshDirtyRegion()
+    local r = self.dirty_region
+    if not r then return end
+    -- Clamp to screen bounds
+    local rx = math.max(0, math.floor(r.x))
+    local ry = math.max(0, math.floor(r.y))
+    local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
+    local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
+    if self.stroke_fast_refresh then
+        -- Fast monochrome waveform: lowest e-ink latency for dark ink
+        Screen:refreshFast(rx, ry, rw, rh)
+    else
+        -- UI waveform: needed for proper shading of light/colored ink
+        Screen:refreshUI(rx, ry, rw, rh)
+    end
+    self.dirty_region = nil
+end
+
+-- Restart the underline hold timer whenever the pen moves beyond the
+-- "still" tolerance; leave it running while the pen rests.
+function Pencil:trackUnderlineHold(x, y)
+    if not self.underline_hold or self.side_button_down then return end
+    if self.underline_still_x
+            and math.abs(x - self.underline_still_x) <= UNDERLINE_STILL_PIXELS
+            and math.abs(y - self.underline_still_y) <= UNDERLINE_STILL_PIXELS then
+        return
+    end
+    self.underline_still_x = x
+    self.underline_still_y = y
+    if not self._underline_check then
+        -- One closure per plugin instance, reused for every reschedule.
+        self._underline_check = function() self:checkUnderlineHold() end
+    end
+    UIManager:unschedule(self._underline_check)
+    UIManager:scheduleIn(UNDERLINE_HOLD_MS / 1000, self._underline_check)
+end
+
+function Pencil:cancelUnderlineHold()
+    self.underline_still_x = nil
+    self.underline_still_y = nil
+    if self._underline_check then
+        UIManager:unschedule(self._underline_check)
+    end
+end
+
+-- Fired after the pen rested UNDERLINE_HOLD_MS: if the stroke so far is a
+-- roughly horizontal line under text, turn it into a native underline.
+function Pencil:checkUnderlineHold()
+    local stroke = self.current_stroke
+    if not (self.pen_down and stroke and not self.highlighting) then return end
+    if stroke.tool ~= TOOL_PEN or #stroke.points < 2 then return end
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    local w, h = bbox.x1 - bbox.x0, bbox.y1 - bbox.y0
+    if w < UNDERLINE_MIN_LENGTH or h > w * UNDERLINE_MAX_SLOPE then return end
+    if not self:underlineTextAbove(bbox) then return end
+
+    -- The ink was only a gesture: drop it and repaint where it was.
+    self.current_stroke = nil
+    self.dirty_region = nil
+    self.view:paintTo(Screen.bb, 0, 0)
+    self:paintTo(Screen.bb, 0, 0)
+    local pad = (stroke.width or 3) + 4
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local rx, ry = math.max(0, bbox.x0 - pad), math.max(0, bbox.y0 - pad)
+    Screen:refreshUI(rx, ry, math.min(sw - rx, w + 2 * pad), math.min(sh - ry, h + 2 * pad))
+end
+
+-- Find the page position of the text just above a screen point, looking
+-- up to UNDERLINE_SEARCH_PIXELS. Returns the page position and the offset.
+function Pencil:findTextAbove(x, y)
+    for dy = 2, UNDERLINE_SEARCH_PIXELS, 4 do
+        local page_pos = self.ui.view:screenToPageTransform({ x = x, y = y - dy })
+        if page_pos then
+            local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, page_pos)
+            if ok and word and word.pos0 then
+                return page_pos, dy
+            end
+        end
+    end
+end
+
+-- Save a native KOReader underline over the text above a stroke bbox.
+-- @return true if a highlight was saved
+function Pencil:underlineTextAbove(bbox)
+    if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
+        return false
+    end
+    local start_pos, dy = self:findTextAbove(bbox.x0 + 2, bbox.y0)
+    if not start_pos then return false end
+    -- Use the same text line for the end point.
+    local end_pos = self.ui.view:screenToPageTransform({ x = bbox.x1 - 2, y = bbox.y0 - dy })
+    if not end_pos then return false end
+
+    local ok, selected = pcall(self.ui.document.getTextFromPositions,
+                               self.ui.document, start_pos, end_pos)
+    if not (ok and selected and selected.pos0 and selected.pos1) then return false end
+    selected.drawer = "underscore"
+
+    local rh = self.ui.highlight
+    rh.selected_text = selected
+    local saved, err = pcall(rh.saveHighlight, rh, false)
+    if not saved then
+        logger.warn("Pencil: saving underline failed:", tostring(err))
+    end
+    if rh.clear then pcall(rh.clear, rh) end
+    return saved
 end
 
 -- End stroke from raw input
@@ -1128,6 +1249,7 @@ function Pencil:loadSettings()
 
     -- Auto-save pencil ink into the PDF file when the document is closed.
     self.auto_save_pdf = settings.auto_save_pdf or false
+    self.underline_hold = settings.underline_hold ~= false
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1181,6 +1303,7 @@ function Pencil:saveSettings()
         myscript_application_key = self.myscript_application_key,
         myscript_hmac_key = self.myscript_hmac_key,
         auto_save_pdf = self.auto_save_pdf,
+        underline_hold = self.underline_hold,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1474,6 +1597,17 @@ function Pencil:addToMainMenu(menu_items)
                                     timeout = 2,
                                 })
                             end
+                        end,
+                    },
+                    {
+                        text = _("Underline by holding at line end"),
+                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the ink is replaced by a native KOReader underline on the words above it."),
+                        checked_func = function()
+                            return self.underline_hold
+                        end,
+                        callback = function()
+                            self.underline_hold = not self.underline_hold
+                            self:saveSettings()
                         end,
                     },
                     {
@@ -3580,6 +3714,7 @@ function Pencil:getLatestAnnotationGroupOnCurrentPage()
 end
 
 function Pencil:getMyScriptStrokesForGroup(group)
+    local MyScript = require("lib/myscript")
     if not group or type(group.stroke_indices) ~= "table" then return nil, { message = "Invalid annotation group" } end
     return MyScript.strokes_from_pencil({ strokes = self.strokes, annotation_groups = { group } }, { group_index = 1, pointer_type = "PEN", pointer_id = 0 })
 end
@@ -3593,6 +3728,7 @@ function Pencil:showRecognizedText(text, group)
 end
 
 function Pencil:createMyScriptClient()
+    local MyScript = require("lib/myscript")
     return MyScript.new{
         application_key = self.myscript_application_key,
         hmac_key = self.myscript_hmac_key,
@@ -3700,6 +3836,7 @@ function Pencil:recognizeGroupWithClient(client, group)
 end
 
 function Pencil:recognizeAnnotationGroup(group)
+    local NetworkMgr = require("ui/network/manager")
     if trimString(self.myscript_application_key) == ""
             or trimString(self.myscript_hmac_key) == "" then
         self:showMyScriptSettingsDialog()
@@ -3870,6 +4007,7 @@ end
 -- Recognize every current annotation group, enrich groups and their referenced
 -- strokes, then persist once. Processing continues after per-group failures.
 function Pencil:recognizeAllAnnotationGroups()
+    local NetworkMgr = require("ui/network/manager")
     if trimString(self.myscript_application_key) == ""
             or trimString(self.myscript_hmac_key) == "" then
         self:showMyScriptSettingsDialog()

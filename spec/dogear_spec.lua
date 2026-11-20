@@ -29,6 +29,48 @@ local function loadPencil()
     for _, name in ipairs(stubbed) do
         package.loaded[name] = permissive()
     end
+    package.preload["ui/widget/buttondialog"] = function()
+        local ButtonDialog = {}
+
+        function ButtonDialog:new(opts)
+            opts = opts or {}
+            setmetatable(opts, { __index = self })
+            return opts
+        end
+
+        return ButtonDialog
+    end
+
+    package.preload["ui/widget/multiinputdialog"] = function()
+        local MultiInputDialog = {}
+
+        function MultiInputDialog:new(opts)
+            opts = opts or {}
+            setmetatable(opts, { __index = self })
+            return opts
+        end
+
+        function MultiInputDialog:getFields()
+            return {}
+        end
+
+        function MultiInputDialog:onShowKeyboard()
+        end
+
+        return MultiInputDialog
+    end
+
+    package.preload["ui/widget/textviewer"] = function()
+        local TextViewer = {}
+
+        function TextViewer:new(opts)
+            opts = opts or {}
+            setmetatable(opts, { __index = self })
+            return opts
+        end
+
+        return TextViewer
+    end
     package.loaded["ui/widget/container/inputcontainer"] = {
         extend = function(_, class) return class end,
     }
