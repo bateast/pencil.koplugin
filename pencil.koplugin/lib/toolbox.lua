@@ -9,7 +9,8 @@ leaving the page:
     [ Pen ][ Marker ][ Eraser ][ Undo ][ x ]     tools
     [ p1 ][ p2 ][ p3 ][ p4 ][ p5 ][ p6 ]         saved presets (hold = save here)
     [ colors ... ]                               pen / marker colors
-    [ widths ... ]                               pen / marker width or eraser size
+    [ widths ... ]                               pen width, eraser size, or for the
+                                                 marker: widths, then opacities
 
 Performance contract (the pen must never lag):
   * The widget does not exist while drawing. It is created when asked for and
@@ -55,13 +56,17 @@ local BLACK = Blitbuffer.COLOR_BLACK
 local WHITE = Blitbuffer.COLOR_WHITE
 local SELECTED_BG = Blitbuffer.Color8(0xDD)
 
+local function opacities_of(p)
+    return p.opacities and p.opacities() or {}
+end
+
 ------------------------------------------------------------------------------
 -- Swatch: one tappable square (a color, a width, an eraser size or a preset)
 ------------------------------------------------------------------------------
 
 local Swatch = InputContainer:extend{
     name = "pencil_toolbox_swatch",
-    kind = "color",       -- "color" | "width" | "eraser" | "preset" | "add"
+    kind = "color",       -- "color" | "width" | "eraser" | "preset" | "add" | "opacity"
     size = 0,
     color = nil,          -- Blitbuffer color (color, preset)
     value = nil,          -- width in px (width, eraser, preset); color name for colors
@@ -100,6 +105,19 @@ local function fill(bb, x, y, w, h, color)
     end
 end
 
+-- A color as it looks at `percent` opacity over white paper: what the marker
+-- really leaves, so an opacity swatch shows the shade it will draw. Colors that
+-- can't be converted (or full opacity) come back as they are.
+local function shade(color, percent)
+    if not percent or percent >= 100
+            or not (color and color.getColorRGB32 and Blitbuffer.ColorRGB32) then
+        return color
+    end
+    local c = color:getColorRGB32()
+    local r, g, b = Toolset.mixOnWhite(c.r, c.g, c.b, percent)
+    return Blitbuffer.ColorRGB32(r, g, b, 0xFF)
+end
+
 function Swatch:paintTo(bb, x, y)
     self.dimen.x, self.dimen.y = x, y
     local w, h = self.dimen.w, self.dimen.h
@@ -108,8 +126,10 @@ function Swatch:paintTo(bb, x, y)
     local ix, iy = x + border, y + border
     local iw, ih = w - 2 * border, h - 2 * border
 
-    if self.kind == "color" then
-        fill(bb, ix, iy, iw, ih, displayColor(self.color, self.value) or BLACK)
+    if self.kind == "color" or self.kind == "opacity" then
+        -- (an opacity swatch carries the marker's color name for the night-mode rule)
+        local name = self.kind == "color" and self.value or self.color_name
+        fill(bb, ix, iy, iw, ih, displayColor(self.color, name) or BLACK)
     elseif self.kind == "width" then
         local bar_h = Toolset.sampleBarHeight(self.value, ih)
         local bar_w = math.floor(iw * 0.7)
@@ -178,14 +198,24 @@ function ToolBox:init()
 
     -- The widest row decides the width: ten pen colors, unless the screen is narrower.
     local p = self.provider
+    -- The marker's last row holds its widths and then its opacities, set apart by
+    -- a wider gap: as many swatches as the pen palette has colors, so the box does
+    -- not grow for it.
+    local opacities = opacities_of(p)
+    self.group_gap = self.gap * 2
+    local extra = self.group_gap - self.gap
+    local marker_row = #Toolset.HIGHLIGHTER_WIDTHS + #opacities
     local widest = math.max(#p.colorsFor("pen"), #p.colorsFor("highlighter"),
-        Toolset.PRESET_CAP, 5)
-    local natural = widest * self.base + (widest - 1) * self.gap
+        Toolset.PRESET_CAP, 5, marker_row)
+    local natural = widest * self.base + (widest - 1) * self.gap + extra
     local max_inner = sw - 2 * (screen_margin + self.padding + border)
     self.inner_w = math.min(natural, max_inner)
     -- One swatch size for every row, set by the widest, so the box keeps its size
     -- whatever the number of presets or the tool.
-    self.swatch_size = Toolset.fitItemSize(widest, self.inner_w, self.base, self.gap, Screen:scaleBySize(20))
+    -- (The floor only matters on absurdly narrow screens, and is low enough that
+    -- a row can always fit rather than overflow its box.)
+    self.swatch_size = Toolset.fitItemSize(widest, self.inner_w - extra, self.base, self.gap,
+        Screen:scaleBySize(10))
 
     self:_build()
 
@@ -212,7 +242,7 @@ end
 function ToolBox:_swatchRow(specs)
     local group = HorizontalGroup:new{ align = "center" }
     for i, spec in ipairs(specs) do
-        if i > 1 then group[#group + 1] = HorizontalSpan:new{ width = self.gap } end
+        if i > 1 then group[#group + 1] = HorizontalSpan:new{ width = spec.gap_before or self.gap } end
         spec.size = self.swatch_size
         group[#group + 1] = Swatch:new(spec)
     end
@@ -273,10 +303,14 @@ function ToolBox:_build()
     local specs = {}
     for i, pr in ipairs(presets) do
         local c = p.colorFor(pr.tool, pr.color_name)
+        local is_marker = pr.tool == "highlighter"
+        if is_marker then c = shade(c, pr.opacity or st.opacity) end
         specs[#specs + 1] = {
             kind = "preset", color = c, color_name = pr.color_name, value = pr.width,
-            is_highlighter = pr.tool == "highlighter",
-            selected = st.tool == pr.tool and st.color_name == pr.color_name and st.width == pr.width,
+            is_highlighter = is_marker,
+            -- a preset with no opacity of its own matches whatever the marker has
+            selected = st.tool == pr.tool and st.color_name == pr.color_name and st.width == pr.width
+                and (pr.opacity == nil or st.opacity == pr.opacity),
             callback = function() p.selectPreset(i); self:refresh() end,
             hold_callback = function() p.savePreset(i); self:refresh() end,
         }
@@ -324,6 +358,17 @@ function ToolBox:_build()
             wspecs[#wspecs + 1] = {
                 kind = "width", value = w, selected = st.width == w,
                 callback = function() p.setWidth(w); self:refresh() end,
+            }
+        end
+    end
+    if st.tool == "highlighter" then
+        local marker_color = p.colorFor("highlighter", st.color_name)
+        for i, percent in ipairs(opacities_of(p)) do
+            wspecs[#wspecs + 1] = {
+                kind = "opacity", color = shade(marker_color, percent), color_name = st.color_name,
+                value = percent, selected = st.opacity == percent,
+                gap_before = i == 1 and self.group_gap or nil,
+                callback = function() p.setOpacity(percent); self:refresh() end,
             }
         end
     end

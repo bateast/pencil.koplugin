@@ -40,7 +40,13 @@ local function install_fakes()
         invert = function(c) return setmetatable({ v = 255 - c.v }, color_mt) end,
     }
     local function Color8(v) return setmetatable({ v = v }, color_mt) end
-    package.loaded["ffi/blitbuffer"] = { Color8 = Color8, COLOR_BLACK = Color8(0), COLOR_WHITE = Color8(255) }
+    local function ColorRGB32(r, g, b)
+        local c = setmetatable({ r = r, g = g, b = b, v = r }, color_mt)
+        c.getColorRGB32 = function() return c end
+        return c
+    end
+    package.loaded["ffi/blitbuffer"] = { Color8 = Color8, ColorRGB32 = ColorRGB32,
+        COLOR_BLACK = Color8(0), COLOR_WHITE = Color8(255) }
 
     package.loaded["device"] = { screen = {
         getWidth = function() return SCREEN.w end,
@@ -116,7 +122,12 @@ end
 -- A stand-in for the plugin's provider
 ------------------------------------------------------------------------------
 
-local function swatch_color(name) return { name = name } end
+-- a palette color that can be converted to RGB, like a real Blitbuffer color
+local function swatch_color(name)
+    local c = { name = name, v = 100, r = 40, g = 80, b = 120 }
+    c.getColorRGB32 = function() return c end
+    return c
+end
 
 local PEN_COLORS, HL_COLORS = {}, {}
 for _, n in ipairs({ "Black", "Red", "Orange", "Yellow", "Green", "Olive", "Cyan", "Blue", "Purple", "Gray" }) do
@@ -131,6 +142,7 @@ local function make_provider(opts)
     opts = opts or {}
     local P = {
         state = { tool = "pen", color_name = "Black", width = 3, eraser_width = 20 },
+        opacity_list = { 20, 35, 50, 65, 80, 100 },
         presets = opts.presets or {
             { tool = "pen", color_name = "Black", width = 3 },
             { tool = "pen", color_name = "Red", width = 3 },
@@ -150,6 +162,7 @@ local function make_provider(opts)
         if t == "eraser" then P.state.color_name, P.state.width = nil, P.state.eraser_width
         elseif t == "highlighter" then P.state.color_name, P.state.width = "Gray", 20
         else P.state.color_name, P.state.width = "Black", 3 end
+        P.state.opacity = t == "highlighter" and 65 or nil
     end
     P.setColor = function(n) log("setColor", n); P.state.color_name = n end
     P.setWidth = function(w) log("setWidth", w); P.state.width = w end
@@ -159,6 +172,8 @@ local function make_provider(opts)
         local p = P.presets[i]
         P.state.tool, P.state.color_name, P.state.width = p.tool, p.color_name, p.width
     end
+    P.opacities = function() return P.opacity_list end
+    P.setOpacity = function(o) log("setOpacity", o); P.state.opacity = o end
     P.savePreset = function(i) log("savePreset", i) end
     P.undo = function() log("undo"); P.undo_depth = P.undo_depth - 1 end
     P.canUndo = function() return P.undo_depth > 0 end
@@ -218,6 +233,41 @@ describe("ToolBox", function()
             assert.equals(4, #of_kind(box, "width"))  -- pen widths
         end)
 
+        it("keeps the same size on a narrow screen with the marker's wider row", function()
+            for _, width in ipairs({ 360, 600, 758, 1264 }) do
+                SCREEN.w, SCREEN.h = width, 1000
+                local P = make_provider()
+                local box = open(P, 100, 500)
+                local w, h = box.frame:getSize().w, box.frame:getSize().h
+                for _, tool in ipairs({ "highlighter", "pen", "eraser", "highlighter" }) do
+                    P.setTool(tool); box:refresh()
+                    assert.equals(w, box.frame:getSize().w, width .. " wide, " .. tool)
+                    assert.equals(h, box.frame:getSize().h, width .. " wide, " .. tool)
+                end
+                assert.is_true(box.dimen.x >= 0 and box.dimen.x + box.dimen.w <= width, "fits at " .. width)
+            end
+        end)
+
+        it("every row, the marker's included, fits inside the box at any screen width", function()
+            for _, width in ipairs({ 320, 360, 600, 758, 1264, 1860 }) do
+                SCREEN.w, SCREEN.h = width, 1000
+                local P = make_provider()
+                local box = open(P, 100, 500)
+                for _, tool in ipairs({ "pen", "highlighter", "eraser" }) do
+                    P.setTool(tool); box:refresh()
+                    local rows = box.frame[1]          -- the VerticalGroup of rows
+                    for i, row in ipairs(rows) do
+                        local group = row[1]           -- CenterContainer -> its HorizontalGroup
+                        if group and group.getSize and row.dimen then
+                            assert.is_true(group:getSize().w <= box.inner_w,
+                                ("row %d (%s) is %d wide in a %d box at screen width %d"):format(
+                                    i, tool, group:getSize().w, box.inner_w, width))
+                        end
+                    end
+                end
+            end
+        end)
+
         it("keeps exactly the same size across tools", function()
             local P = make_provider()
             local box = open(P)
@@ -265,6 +315,102 @@ describe("ToolBox", function()
             assert.equals(9, #of_kind(box, "color"))
             P.setTool("pen"); box:refresh()
             assert.equals(10, #of_kind(box, "color"))
+        end)
+
+        it("shows widths then opacities for the marker, and neither opacity nor extra rows otherwise", function()
+            local P = make_provider()
+            local box = open(P)
+            assert.equals(0, #of_kind(box, "opacity"))           -- pen
+            P.setTool("highlighter"); box:refresh()
+            assert.equals(4, #of_kind(box, "width"))
+            assert.equals(6, #of_kind(box, "opacity"))
+            P.setTool("eraser"); box:refresh()
+            assert.equals(0, #of_kind(box, "opacity"))
+        end)
+
+        it("marks the marker's current opacity", function()
+            local P = make_provider()
+            local box = open(P)
+            P.setTool("highlighter"); P.state.opacity = 50; box:refresh()
+            local sel = {}
+            for _, o in ipairs(of_kind(box, "opacity")) do if o.selected then sel[#sel + 1] = o.value end end
+            assert.same({ 50 }, sel)
+        end)
+
+        it("an opacity swatch sets the opacity and repaints only the box", function()
+            local P = make_provider()
+            local box = open(P)
+            P.setTool("highlighter"); box:refresh()
+            P.calls = {}; dirty = {}
+            of_kind(box, "opacity")[2]:onTapSwatch()
+            assert.same({ "setOpacity:35" }, P.calls)
+            assert.equals(box, dirty[1].w)
+            assert.equals(35, P.state.opacity)
+            local sel
+            for _, o in ipairs(of_kind(box, "opacity")) do if o.selected then sel = o.value end end
+            assert.equals(35, sel)
+        end)
+
+        it("sets the opacities apart from the widths with a wider gap", function()
+            local P = make_provider()
+            local box = open(P)
+            P.setTool("highlighter"); box:refresh()
+            local ops = of_kind(box, "opacity")
+            assert.is_truthy(ops[1].gap_before)
+            assert.is_true(ops[1].gap_before > box.gap)
+            assert.is_nil(ops[2].gap_before)
+        end)
+
+        it("an opacity swatch shows the marker's color at that shade (lighter when fainter)", function()
+            local P = make_provider()
+            local box = open(P)
+            P.setTool("highlighter"); box:refresh()
+            local ops = of_kind(box, "opacity")
+            local function shade_of(sw) return sw.color.r end
+            assert.is_true(shade_of(ops[1]) > shade_of(ops[3]))   -- 20% lighter than 50%
+            assert.is_true(shade_of(ops[3]) > shade_of(ops[5]))   -- 50% lighter than 80%
+            assert.equals(40, shade_of(ops[6]))                   -- 100%: the color itself
+        end)
+
+        it("paints opacity swatches with the color path, so the shade is kept", function()
+            local P = make_provider()
+            local box = open(P)
+            P.setTool("highlighter"); box:refresh()
+            local sw = of_kind(box, "opacity")[1]
+            local calls = {}
+            local bb = setmetatable({}, { __index = function(_, name)
+                return function(_, ...) calls[#calls + 1] = { name = name, args = { ... } } end
+            end })
+            sw:paintTo(bb, 0, 0)
+            local filled
+            for _, c in ipairs(calls) do
+                if c.name == "paintRectRGB32" and c.args[5] == sw.color then filled = true end
+            end
+            assert.is_true(filled)
+        end)
+
+        it("a marker preset's swatch shows its own opacity, else the marker's", function()
+            local P = make_provider{ presets = {
+                { tool = "highlighter", color_name = "Gray", width = 20, opacity = 20 },
+                { tool = "highlighter", color_name = "Gray", width = 20 },
+            } }
+            P.state = { tool = "highlighter", color_name = "Gray", width = 20, eraser_width = 20, opacity = 80 }
+            local box = open(P)
+            local presets = of_kind(box, "preset")
+            assert.is_true(presets[1].color.r > presets[2].color.r)   -- 20% fainter than the marker's 80%
+        end)
+
+        it("a preset with an opacity is selected only when the marker has that opacity", function()
+            local P = make_provider{ presets = {
+                { tool = "highlighter", color_name = "Gray", width = 20, opacity = 35 },
+                { tool = "highlighter", color_name = "Gray", width = 20, opacity = 80 },
+                { tool = "highlighter", color_name = "Gray", width = 20 },
+            } }
+            P.state = { tool = "highlighter", color_name = "Gray", width = 20, eraser_width = 20, opacity = 80 }
+            local box = open(P)
+            local sel = {}
+            for i, s in ipairs(of_kind(box, "preset")) do sel[i] = s.selected end
+            assert.same({ false, true, true }, sel)   -- the opacity-less preset matches any opacity
         end)
 
         it("shows eraser sizes and no colors for the eraser", function()

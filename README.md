@@ -83,7 +83,8 @@ A small panel for switching tool without leaving the page. Open it from **Pencil
 
 - **Tools**: Pen, Marker (highlighter), Eraser, Undo, and a close button
 - **Presets**: a row of up to six saved tools (default pens and markers). Tap to take one up; **hold** a slot, or tap the **+**, to save the tool in hand there
-- **Colors and widths**: ten pen colors, nine marker colors (the same as the highlighter menu: all but black), pen widths 3/5/7/9 and marker widths 12/20/30/40. The eraser has three sizes (10/20/40). Marker opacity stays in the highlighter menu
+- **Colors, widths and opacity**: ten pen colors, nine marker colors (the same as the highlighter menu: all but black), pen widths 3/5/7/9 and marker widths 12/20/30/40. The marker's last row also holds its six opacities (20 to 100%), drawn as the shade the marker will leave. The eraser has three sizes (10/20/40)
+- Marker presets remember their opacity; a preset saved without one keeps whatever opacity the marker has
 - Stays open while you pick several things; tap outside or the close button to dismiss it
 - Everything is remembered between sessions. **Reset saved tools** restores the default presets
 

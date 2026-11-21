@@ -7,7 +7,9 @@ only used when the tool box opens, when a tool is picked, and when settings
 are loaded or saved.
 
 A "preset" is a small table: { tool = "pen"|"highlighter", color_name = string,
-width = integer }. The eraser is not a preset; it is a tool with its own size.
+width = integer, opacity = integer percent }. Opacity belongs to the marker and is
+optional: a preset without one leaves the marker's opacity as it is. The eraser is
+not a preset; it is a tool with its own size.
 
 @module pencil.lib.toolset
 --]]--
@@ -43,7 +45,8 @@ function Toolset.defaults()
 end
 
 local function copy(p)
-    return { tool = p.tool, color_name = p.color_name, width = p.width }
+    return { tool = p.tool, color_name = p.color_name, width = p.width,
+             opacity = p.tool == "highlighter" and p.opacity or nil }
 end
 Toolset.copy = copy
 
@@ -54,6 +57,11 @@ function Toolset.isValidWidth(w)
         and w >= Toolset.MIN_WIDTH and w <= Toolset.MAX_WIDTH
 end
 
+-- Is `o` a usable opacity: whole percent, 1 to 100?
+function Toolset.isValidOpacity(o)
+    return type(o) == "number" and o == math.floor(o) and o >= 1 and o <= 100
+end
+
 -- Is `p` a usable preset? `valid_colors` is a set: color_name -> true.
 function Toolset.isValid(p, valid_colors)
     if type(p) ~= "table" then return false end
@@ -62,6 +70,7 @@ function Toolset.isValid(p, valid_colors)
     if valid_colors and not valid_colors[p.color_name] then return false end
     if type(p.width) ~= "number" or p.width ~= p.width then return false end
     if p.width < Toolset.MIN_WIDTH or p.width > Toolset.MAX_WIDTH then return false end
+    if p.opacity ~= nil and not Toolset.isValidOpacity(p.opacity) then return false end
     return true
 end
 
@@ -74,8 +83,9 @@ function Toolset.normalize(saved, valid_colors)
         for _, p in ipairs(saved) do
             if #out >= Toolset.PRESET_CAP then break end
             if Toolset.isValid(p, valid_colors) then
-                out[#out + 1] = { tool = p.tool, color_name = p.color_name,
-                                  width = math.floor(p.width + 0.5) }
+                local q = copy(p)
+                q.width = math.floor(p.width + 0.5)
+                out[#out + 1] = q
             end
         end
     end
@@ -91,6 +101,7 @@ end
 function Toolset.same(a, b)
     if not (a and b) then return false end
     return a.tool == b.tool and a.color_name == b.color_name and a.width == b.width
+        and a.opacity == b.opacity
 end
 
 -- Index of the preset equal to `p` in `list`, or nil.
@@ -136,6 +147,14 @@ function Toolset.remember(cur, new, prev)
         return copy(cur)
     end
     return prev
+end
+
+-- What a color looks like at `percent` opacity over white paper, as r, g, b.
+-- The same mix the highlighter itself uses, so a swatch shows the real shade.
+function Toolset.mixOnWhite(r, g, b, percent)
+    local k = percent / 100
+    local function mix(v) return math.floor(255 - (255 - v) * k + 0.5) end
+    return mix(r), mix(g), mix(b)
 end
 
 -- Item size so `count` items with `gap` between them fit in `avail_w`: the base

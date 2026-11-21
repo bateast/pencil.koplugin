@@ -2999,8 +2999,8 @@ function Pencil:findColorByName(name)
     return self:findColor(TOOL_PEN, name) or self:findColor(TOOL_HIGHLIGHTER, name)
 end
 
--- The tool in hand as a plain table: { tool, color_name, width, eraser_width }.
--- For the eraser, `width` is its size.
+-- The tool in hand as a plain table: { tool, color_name, width, eraser_width },
+-- plus `opacity` (percent) for the highlighter. For the eraser, `width` is its size.
 function Pencil:getToolState()
     local tool = self.current_tool
     local eraser_width = self.tool_settings[TOOL_ERASER].width
@@ -3008,7 +3008,8 @@ function Pencil:getToolState()
         return { tool = tool, width = eraser_width, eraser_width = eraser_width }
     end
     local ts = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
-    return { tool = tool, color_name = ts.color_name, width = ts.width, eraser_width = eraser_width }
+    return { tool = tool, color_name = ts.color_name, width = ts.width, eraser_width = eraser_width,
+             opacity = tool == TOOL_HIGHLIGHTER and alphaToOpacity(ts.alpha) or nil }
 end
 
 -- Make `st` the tool in hand. Only the fields it carries change: { tool = "pen" }
@@ -3030,6 +3031,15 @@ function Pencil:applyToolState(st)
     end
     if Toolset.isValidWidth(st.width) then
         ts.width = st.width
+    end
+    -- Only the opacities the menus offer, like setHighlighterOpacity
+    if st.tool == TOOL_HIGHLIGHTER and st.opacity then
+        for _, allowed in ipairs(HIGHLIGHTER_OPACITIES) do
+            if allowed == st.opacity then
+                ts.alpha = opacityToAlpha(allowed)
+                break
+            end
+        end
     end
     self.current_tool = st.tool
 end
@@ -3070,6 +3080,8 @@ function Pencil:makeToolBoxProvider()
                 plugin:saveSettings()
             end
         end,
+        opacities = function() return HIGHLIGHTER_OPACITIES end,
+        setOpacity = function(percent) plugin:setHighlighterOpacity(percent) end,
         setEraserWidth = function(width)
             if Toolset.isValidWidth(width) then
                 plugin.tool_settings[TOOL_ERASER].width = width
@@ -3079,7 +3091,8 @@ function Pencil:makeToolBoxProvider()
         selectPreset = function(idx)
             local p = plugin.tool_presets[idx]
             if p then
-                plugin:switchTool({ tool = p.tool, color_name = p.color_name, width = p.width })
+                plugin:switchTool({ tool = p.tool, color_name = p.color_name, width = p.width,
+                                    opacity = p.opacity })
             end
         end,
         -- store the tool in hand in slot idx (one past the end adds a slot)
@@ -3087,7 +3100,7 @@ function Pencil:makeToolBoxProvider()
             local st = plugin:getToolState()
             if st.tool == TOOL_ERASER then return end
             local stored = Toolset.store(plugin.tool_presets, idx,
-                { tool = st.tool, color_name = st.color_name, width = st.width },
+                { tool = st.tool, color_name = st.color_name, width = st.width, opacity = st.opacity },
                 plugin.valid_color_names)
             if stored then plugin:saveSettings() end
         end,

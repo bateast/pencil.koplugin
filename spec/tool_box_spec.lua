@@ -361,6 +361,124 @@ describe("quick tool box wiring", function()
         end)
     end)
 
+    describe("marker opacity", function()
+        local function marker(p)
+            local prov = p:makeToolBoxProvider()
+            prov.setTool("highlighter")
+            return prov
+        end
+
+        it("is part of the tool state for the marker only", function()
+            local p = new_pencil()
+            assert.is_nil(p:getToolState().opacity)              -- pen
+            p:switchTool({ tool = "highlighter" })
+            assert.equals(65, p:getToolState().opacity)          -- upstream's default
+            p:switchTool({ tool = "eraser" })
+            assert.is_nil(p:getToolState().opacity)
+        end)
+
+        it("offers the same opacities as the highlighter menu", function()
+            local p = new_pencil()
+            assert.same({ 20, 35, 50, 65, 80, 100 }, p:makeToolBoxProvider().opacities())
+        end)
+
+        it("setOpacity changes the marker and is saved", function()
+            local p = new_pencil()
+            local prov = marker(p)
+            prov.setOpacity(35)
+            assert.equals(35, p:getToolState().opacity)
+            assert.equals(35, store.pencil_annotation_settings.highlighter_opacity)
+        end)
+
+        it("setOpacity ignores a value the menus don't offer", function()
+            local p = new_pencil()
+            local prov = marker(p)
+            prov.setOpacity(42)
+            prov.setOpacity(0)
+            prov.setOpacity(500)
+            assert.equals(65, p:getToolState().opacity)
+        end)
+
+        it("the strokes it draws carry that opacity", function()
+            local p = new_pencil()
+            local prov = marker(p)
+            prov.setOpacity(35)
+            p:startRawStroke()
+            p:addRawPoint(100, 100); p:addRawPoint(160, 100)
+            p:endRawStroke()
+            local s = p.strokes[1]
+            assert.equals("highlighter", s.tool)
+            assert.equals(math.floor(35 * 255 / 100 + 0.5), s.alpha)
+        end)
+
+        it("opacity does not touch the pen", function()
+            local p = new_pencil()
+            marker(p).setOpacity(20)
+            p:switchTool({ tool = "pen" })
+            assert.equals(255, p.tool_settings.pen.alpha)
+        end)
+
+        it("saving a marker preset keeps its opacity; a pen preset has none", function()
+            local p = new_pencil()
+            local prov = marker(p)
+            prov.setColor("Cyan"); prov.setOpacity(35)
+            prov.savePreset(1)
+            assert.same({ tool = "highlighter", color_name = "Cyan", width = 20, opacity = 35 }, p.tool_presets[1])
+            prov.setTool("pen")
+            prov.savePreset(2)
+            assert.is_nil(p.tool_presets[2].opacity)
+        end)
+
+        it("taking up a preset sets its opacity", function()
+            local p = new_pencil()
+            p.tool_presets = { { tool = "highlighter", color_name = "Yellow", width = 30, opacity = 80 } }
+            p:makeToolBoxProvider().selectPreset(1)
+            assert.equals("Yellow", p.tool_settings.highlighter.color_name)
+            assert.equals(30, p.tool_settings.highlighter.width)
+            assert.equals(80, p:getToolState().opacity)
+        end)
+
+        it("a preset without an opacity leaves the marker's opacity alone", function()
+            local p = new_pencil()
+            marker(p).setOpacity(35)
+            p:switchTool({ tool = "pen" })
+            p.tool_presets = { { tool = "highlighter", color_name = "Yellow", width = 30 } }
+            p:makeToolBoxProvider().selectPreset(1)
+            assert.equals(35, p:getToolState().opacity)
+        end)
+
+        it("a preset with an opacity the menus don't offer is applied without it", function()
+            local p = new_pencil()
+            p.tool_presets = { { tool = "highlighter", color_name = "Yellow", width = 30, opacity = 42 } }
+            p:makeToolBoxProvider().selectPreset(1)
+            assert.equals("Yellow", p.tool_settings.highlighter.color_name)
+            assert.equals(65, p:getToolState().opacity)
+        end)
+
+        it("swapping to the previous tool restores its opacity", function()
+            local p = new_pencil()
+            local prov = marker(p)
+            prov.setOpacity(35)
+            p:switchTool({ tool = "pen" })           -- previous: the marker at 35%
+            prov.setTool("highlighter")
+            prov.setOpacity(80)                       -- change it behind the swap's back
+            p:switchTool({ tool = "pen" })
+            p:onPencilSwapTool()                      -- back to the marker as it was left (80)
+            assert.equals("highlighter", p.current_tool)
+            assert.equals(80, p:getToolState().opacity)
+        end)
+
+        it("swap restores the marker's opacity when a preset changed it", function()
+            local p = new_pencil()
+            marker(p).setOpacity(35)
+            p.tool_presets = { { tool = "highlighter", color_name = "Yellow", width = 20, opacity = 80 } }
+            p:makeToolBoxProvider().selectPreset(1)   -- the marker at 35 -> the marker at 80
+            assert.equals(80, p:getToolState().opacity)
+            p:onPencilSwapTool()
+            assert.equals(35, p:getToolState().opacity)
+        end)
+    end)
+
     describe("settings", function()
         it("round-trips presets, marker color and width, and eraser size", function()
             local p = new_pencil()
@@ -382,6 +500,34 @@ describe("quick tool box wiring", function()
             assert.equals(7, q.tool_settings.pen.width)
             assert.same({ tool = "pen", color_name = "Red", width = 7 }, q.tool_presets[1])
             assert.equals("pen", q.current_tool)   -- always starts on the pen
+        end)
+
+        it("round-trips a marker preset's opacity", function()
+            local p = new_pencil()
+            p.tool_presets = { { tool = "highlighter", color_name = "Olive", width = 30, opacity = 35 } }
+            p:saveSettings()
+            reset_class_state()
+            local q = new_pencil()
+            assert.same({ tool = "highlighter", color_name = "Olive", width = 30, opacity = 35 }, q.tool_presets[1])
+        end)
+
+        it("drops a preset with a nonsense opacity but keeps the others", function()
+            store.pencil_annotation_settings = { tool_presets = {
+                { tool = "highlighter", color_name = "Gray", width = 20, opacity = 9999 },
+                { tool = "pen", color_name = "Red", width = 3 },
+            } }
+            local p = new_pencil()
+            assert.equals(1, #p.tool_presets)
+            assert.equals("Red", p.tool_presets[1].color_name)
+        end)
+
+        it("presets saved before opacity existed still load, without one", function()
+            store.pencil_annotation_settings = { tool_presets = {
+                { tool = "highlighter", color_name = "Yellow", width = 20 },
+            } }
+            local p = new_pencil()
+            assert.is_nil(p.tool_presets[1].opacity)
+            assert.equals("Yellow", p.tool_presets[1].color_name)
         end)
 
         it("survives a malformed settings file", function()

@@ -47,6 +47,89 @@ describe("Toolset.isValidWidth", function()
     end)
 end)
 
+describe("Toolset.isValidOpacity", function()
+    it("accepts whole percents from 1 to 100", function()
+        for _, ok in ipairs({ 1, 20, 65, 100 }) do assert.is_true(Toolset.isValidOpacity(ok), tostring(ok)) end
+    end)
+
+    it("rejects zero, over 100, fractions and non-numbers", function()
+        for _, bad in ipairs({ 0, -5, 101, 65.5, "65", true }) do
+            assert.is_false(Toolset.isValidOpacity(bad), tostring(bad))
+        end
+        assert.is_false(Toolset.isValidOpacity(nil))
+    end)
+end)
+
+describe("Toolset.mixOnWhite", function()
+    it("is the color itself at full opacity", function()
+        assert.same({ 10, 100, 200 }, { Toolset.mixOnWhite(10, 100, 200, 100) })
+    end)
+
+    it("is white at zero opacity", function()
+        assert.same({ 255, 255, 255 }, { Toolset.mixOnWhite(10, 100, 200, 0) })
+    end)
+
+    it("lightens toward white as opacity drops", function()
+        local r20 = Toolset.mixOnWhite(0, 0, 0, 20)
+        local r50 = Toolset.mixOnWhite(0, 0, 0, 50)
+        local r80 = Toolset.mixOnWhite(0, 0, 0, 80)
+        assert.is_true(r20 > r50 and r50 > r80)
+        assert.equals(128, r50)
+    end)
+end)
+
+describe("preset opacity", function()
+    it("is valid on a marker preset, and optional", function()
+        assert.is_true(Toolset.isValid({ tool = "highlighter", color_name = "Gray", width = 20, opacity = 50 }, COLORS))
+        assert.is_true(Toolset.isValid({ tool = "highlighter", color_name = "Gray", width = 20 }, COLORS))
+    end)
+
+    it("makes the preset invalid when out of range", function()
+        assert.is_false(Toolset.isValid({ tool = "highlighter", color_name = "Gray", width = 20, opacity = 500 }, COLORS))
+        assert.is_false(Toolset.isValid({ tool = "highlighter", color_name = "Gray", width = 20, opacity = "x" }, COLORS))
+    end)
+
+    it("normalize keeps a marker's opacity and drops a pen's", function()
+        local out = Toolset.normalize({
+            { tool = "highlighter", color_name = "Gray", width = 20, opacity = 35 },
+            { tool = "pen", color_name = "Red", width = 3, opacity = 35 },
+        }, COLORS)
+        assert.equals(35, out[1].opacity)
+        assert.is_nil(out[2].opacity)
+    end)
+
+    it("normalize drops a preset whose opacity is bad", function()
+        local out = Toolset.normalize({
+            { tool = "highlighter", color_name = "Gray", width = 20, opacity = 999 },
+            { tool = "pen", color_name = "Red", width = 3 },
+        }, COLORS)
+        assert.equals(1, #out)
+        assert.equals("pen", out[1].tool)
+    end)
+
+    it("same() tells presets apart by opacity", function()
+        local a = { tool = "highlighter", color_name = "Gray", width = 20, opacity = 35 }
+        local b = { tool = "highlighter", color_name = "Gray", width = 20, opacity = 80 }
+        assert.is_false(Toolset.same(a, b))
+        assert.is_true(Toolset.same(a, { tool = "highlighter", color_name = "Gray", width = 20, opacity = 35 }))
+    end)
+
+    it("store keeps the opacity, as a copy", function()
+        local list = {}
+        local p = { tool = "highlighter", color_name = "Gray", width = 20, opacity = 50 }
+        Toolset.store(list, 1, p, COLORS)
+        p.opacity = 99
+        assert.equals(50, list[1].opacity)
+    end)
+
+    it("two markers differing only in opacity are both kept", function()
+        local list = {}
+        Toolset.store(list, 1, { tool = "highlighter", color_name = "Gray", width = 20, opacity = 35 }, COLORS)
+        Toolset.store(list, 2, { tool = "highlighter", color_name = "Gray", width = 20, opacity = 80 }, COLORS)
+        assert.equals(2, #list)
+    end)
+end)
+
 describe("Toolset.isValid", function()
     it("rejects the eraser and unknown tools as presets", function()
         assert.is_false(Toolset.isValid(preset("eraser", "Black", 10), COLORS))
