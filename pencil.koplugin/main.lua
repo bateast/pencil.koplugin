@@ -43,6 +43,7 @@ local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local time = require("ui/time")
+local util = require("ffi/util")
 
 -- Check if device supports touch input
 if not Device:isTouchDevice() then
@@ -1808,8 +1809,12 @@ function Pencil:addToMainMenu(menu_items)
             },
             {
                 text = _("Handwriting recognition"),
+                help_text = _("Provides handscript recognition through Myscript cloud service. Push strokes to cloud and require a (free) Myscript developper account."),
                 sub_item_table = {
-                    { text = _("Configure MyScript"), callback = function() self:showMyScriptSettingsDialog() end },
+                    { text = _("Configure MyScript"),
+                      callback = function() self:showMyScriptSettingsDialog() end,
+                      help_text = _("Configure MyScript language and cloud keys. Require a (free) Myscript developper account"),
+                    },
                     { text = _("Recognize latest annotation group"),
                       enabled_func = function() return self:getLatestAnnotationGroupOnCurrentPage() ~= nil end,
                       callback = function() local g = self:getLatestAnnotationGroupOnCurrentPage(); if g then self:recognizeAnnotationGroup(g) end end },
@@ -3324,41 +3329,45 @@ function Pencil:showAnnotationHoldMenu(group)
 
     if text ~= "" then
         rows[#rows + 1] = {{
-            text = _("Show recognized text"),
+            text = _("Show annotation text"),
             callback = function()
                 UIManager:close(dialog)
                 self:showRecognizedText(text, group)
             end,
         }}
         rows[#rows + 1] = {{
-            text = _("Edit recognized text"),
+            text = _("Edit annotation text"),
             callback = function()
                 UIManager:close(dialog)
                 self:showAnnotationTextEditor(group)
             end,
         }}
-        rows[#rows + 1] = {{
-            text = _("Recognize again"),
-            callback = function()
-                UIManager:close(dialog)
-                self:recognizeAnnotationGroup(group)
-            end,
-        }}
+        if self.myscript_application_key and self.myscript_application_key ~= "" then
+            rows[#rows + 1] = {{
+                    text = _("Recognize again"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:recognizeAnnotationGroup(group)
+                    end,
+            }}
+        end
     else
         rows[#rows + 1] = {{
-            text = _("Create text"),
+            text = _("Create annotation text"),
             callback = function()
                 UIManager:close(dialog)
                 self:showAnnotationTextEditor(group)
             end,
         }}
-        rows[#rows + 1] = {{
-            text = _("Recognize this annotation"),
-            callback = function()
-                UIManager:close(dialog)
-                self:recognizeAnnotationGroup(group)
-            end,
-        }}
+        if self.myscript_application_key and self.myscript_application_key ~= "" then
+            rows[#rows + 1] = {{
+                    text = _("Recognize this annotation"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:recognizeAnnotationGroup(group)
+                    end,
+            }}
+        end
     end
 
     if group.image_path then
@@ -4032,8 +4041,12 @@ function Pencil:showMyScriptSettingsDialog()
         title = _("MyScript settings"),
         fields = {
             { description = _("Recognition language"), text = self.myscript_language or "en_US", hint = "en_US" },
-            { description = _("Application key"), text = self.myscript_application_key or "" },
-            { description = _("HMAC key"), text = self.myscript_hmac_key or "", text_type = "password" },
+            { description = _("Application key"), text = self.myscript_application_key or "",
+              help_text = _("Application specific identifier from MyScript Developper page. Stored plain text in Koreader settings."),
+},
+            { description = _("HMAC key"), text = self.myscript_hmac_key or "", text_type = "password",
+              help_text = _("Application specific secret from MyScript Developper page. Stored plain text in Koreader settings."),
+            },
         },
         buttons = {{
             { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
